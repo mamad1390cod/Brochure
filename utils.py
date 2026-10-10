@@ -2,7 +2,32 @@
 Utility functions for Bot-File-School.
 """
 
-from typing import Optional
+from typing import Any, Optional
+
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import InlineKeyboardMarkup, Message
+
+from logger import logger
+
+
+async def safe_edit_text(
+    message: Message,
+    text: str,
+    *,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    **kwargs: Any,
+) -> None:
+    """Edit a message while treating Telegram's exact no-op response as success."""
+    try:
+        await message.edit_text(text, reply_markup=reply_markup, **kwargs)
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).casefold():
+            raise
+        logger.debug(
+            "Skipped unchanged Telegram message edit (chat=%s, message=%s)",
+            message.chat.id,
+            message.message_id,
+        )
 
 
 def format_file_size(size) -> str:

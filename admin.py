@@ -4,20 +4,24 @@ Handles admin authentication, management, and all admin operations.
 """
 
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile,
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters import StateFilter, Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import secrets
+import sqlite3
+import uuid
 
 import models
 import keyboards
 import security
 from config import MAIN_ADMIN_ID, ADMIN_PASSWORD, MAX_LOGIN_ATTEMPTS, LOGIN_LOCKOUT_MINUTES
 from permissions import check_permission, is_admin, is_main_admin, is_owner, PERMISSIONS, DEFAULT_ADMIN_PERMISSIONS
-from utils import format_note_info, format_page_range, escape_html
+from utils import format_note_info, format_page_range, escape_html, safe_edit_text
 from middleware import AdminAuthMiddleware
 from logger import logger
 import convert
@@ -34,6 +38,19 @@ router.message.middleware(AdminAuthMiddleware())
 
 class AdminLogin(StatesGroup):
     waiting_password = State()
+
+
+async def _edit_admin_login_message(
+    callback: CallbackQuery,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+) -> None:
+    await safe_edit_text(
+        callback.message,
+        text,
+        reply_markup=reply_markup,
+        parse_mode="HTML",
+    )
 
 
 class AdminAddFlow(StatesGroup):
@@ -110,21 +127,63 @@ class ClassEditFlow(StatesGroup):
     waiting_value = State()   # generic single-value edit (title/time/...)
 
 
+class WeeklyClassFlow(StatesGroup):
+    selecting_track = State()
+    selecting_day = State()
+    entering_name = State()
+    entering_start = State()
+    entering_end = State()
+    confirming = State()
+
+
 # ─── Admin Authentication ────────────────────────────────────────────────────
+
+async def _bulk_create(names: list[str], create_fn, taken: set[str]):
+    """Create every name that is not already taken.
+
+    Duplicates inside one message (and names that already exist) used to abort
+    the whole bulk insert with an IntegrityError after a few rows had already
+    been written. Returns (created, skipped) so the admin is told what happened.
+    """
+    created: list[tuple[int, str]] = []
+    skipped: list[str] = []
+    for name in names:
+        key = name.strip()
+        if not key or key in taken:
+            skipped.append(name.strip() or name)
+            continue
+        try:
+            new_id = await create_fn(key)
+        except sqlite3.IntegrityError:
+            # lost a race against another admin - report instead of crashing
+            skipped.append(key)
+            continue
+        taken.add(key)
+        created.append((new_id, name))
+    return created, skipped
+
 
 async def _ensure_owner_in_db(user_id: int, user) -> None:
     """Make sure an owner (main or DB-flagged) has a DB admin row."""
     admin = await models.get_admin_by_user_id(user_id)
     if not admin:
         from security import hash_password
-        await models.create_admin(
-            user_id=user_id,
-            username=user.username or "",
-            full_name=user.full_name or "",
-            password_hash=hash_password(ADMIN_PASSWORD),
-            is_main_admin=True,
-        )
+        try:
+            await models.create_admin(
+                user_id=user_id,
+                username=user.username or "",
+                full_name=user.full_name or "",
+                password_hash=hash_password(ADMIN_PASSWORD),
+                is_main_admin=True,
+            )
+        except sqlite3.IntegrityError:
+            admin = await models.get_admin_by_user_id(user_id)
+            if admin is None:
+                raise
+            return
         admin = await models.get_admin_by_user_id(user_id)
+        if admin is None:
+            raise RuntimeError(f"Owner admin row was not created for user {user_id}.")
         await models.set_admin_permissions(admin["id"], list(PERMISSIONS.keys()))
 
 
@@ -133,33 +192,48 @@ async def admin_login_handler(callback: CallbackQuery, state: FSMContext):
     """Start admin login flow.
     Owner (MAIN_ADMIN_ID or DB is_main_admin) skips the password form
     entirely - identity is verified by Telegram user ID + project config."""
-    await callback.answer()
-
     user_id = callback.from_user.id
+    if not await is_admin(user_id):
+        await callback.answer(
+            "❌ این بخش فقط برای ادمین‌های ثبت‌شده فعال است.",
+            show_alert=True,
+        )
+        return
 
     # Already authenticated in this session - go straight to panel
     if security.admin_sessions.is_authenticated(user_id):
-        await callback.message.edit_text(
+        await callback.answer()
+        await _edit_admin_login_message(
+            callback,
             "✅ <b>پنل مدیریت</b>\n\n"
             "به پنل مدیریت خوش آمدید!",
-            reply_markup=await keyboards.admin_main_menu_keyboard_for(user_id),
-            parse_mode="HTML",
+            await keyboards.admin_main_menu_keyboard_for(user_id),
         )
         return
 
     # ── Owner auto-login: no password, no button flow ──
     if await is_owner(user_id):
+        await callback.answer()
         await _ensure_owner_in_db(user_id, callback.from_user)
         security.admin_sessions.login(user_id)
         security.rate_limiter.reset(user_id)
-        await callback.message.edit_text(
+        await _edit_admin_login_message(
+            callback,
             "👑 <b>پنل مدیریت (Owner)</b>\n\n"
             "به عنوان Owner شناسایی شدید — ورود مستقیم بدون رمز.",
-            reply_markup=await keyboards.admin_main_menu_keyboard_for(user_id),
-            parse_mode="HTML",
+            await keyboards.admin_main_menu_keyboard_for(user_id),
         )
         logger.info(f"Owner auto-login: {user_id}")
         return
+
+    if callback.message.chat.type in {"group", "supergroup"}:
+        await callback.answer(
+            "برای ورود امن، ابتدا در گفتگوی خصوصی ربات /start را اجرا کنید.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer()
 
     # Check rate limiting
     if security.rate_limiter.is_locked(user_id):
@@ -171,12 +245,12 @@ async def admin_login_handler(callback: CallbackQuery, state: FSMContext):
         return
 
     await state.set_state(AdminLogin.waiting_password)
-    await callback.message.edit_text(
+    await _edit_admin_login_message(
+        callback,
         "🔐 <b>ورود به پنل مدیریت</b>\n\n"
         "لطفاً رمز عبور ادمین را ارسال کنید\n"
         "<i>(حروف بزرگ/کوچک تفاوتی ندارد):</i>",
-        reply_markup=keyboards.cancel_keyboard("admin_login"),
-        parse_mode="HTML",
+        keyboards.cancel_keyboard("admin_login"),
     )
 
 
@@ -197,23 +271,11 @@ async def admin_login_password(message: Message, state: FSMContext):
             except Exception:
                 pass
             # Ensure main admin exists in DB
-            admin = await models.get_admin_by_user_id(user_id)
-            if not admin:
-                from security import hash_password
-                await models.create_admin(
-                    user_id=user_id,
-                    username=message.from_user.username or "",
-                    full_name=message.from_user.full_name or "",
-                    password_hash=hash_password(ADMIN_PASSWORD),
-                    is_main_admin=True,
-                )
-                # Grant all permissions
-                admin = await models.get_admin_by_user_id(user_id)
-                await models.set_admin_permissions(admin["id"], list(PERMISSIONS.keys()))
+            await _ensure_owner_in_db(user_id, message.from_user)
             await message.answer(
                 "✅ <b>ورود موفق!</b>\n\n"
                 "ادمین اصلی، به پنل مدیریت خوش آمدید!",
-                reply_markup=keyboards.admin_main_menu_keyboard(),
+                reply_markup=await keyboards.admin_main_menu_keyboard_for(user_id),
                 parse_mode="HTML",
             )
             logger.info(f"Main admin logged in: {user_id}")
@@ -233,6 +295,9 @@ async def admin_login_password(message: Message, state: FSMContext):
     # Check database admin
     admin = await models.get_admin_by_user_id(user_id)
     if admin and security.verify_password(password, admin["password_hash"]):
+        if security.password_hash_needs_upgrade(admin["password_hash"]):
+            await models.update_admin_password(
+                admin["id"], security.hash_password(password))
         security.rate_limiter.reset(user_id)
         security.admin_sessions.login(user_id)
         await state.clear()
@@ -244,7 +309,7 @@ async def admin_login_password(message: Message, state: FSMContext):
             "✅ <b>ورود موفق!</b>\n\n"
             + ("👑 Owner، به پنل مدیریت خوش آمدید!"
                if admin["is_main_admin"] else "به پنل مدیریت خوش آمدید!"),
-            reply_markup=keyboards.admin_main_menu_keyboard(),
+            reply_markup=await keyboards.admin_main_menu_keyboard_for(user_id),
             parse_mode="HTML",
         )
         logger.info(f"Admin logged in: {user_id} ({admin['username']})")
@@ -275,7 +340,7 @@ async def admin_logout_handler(callback: CallbackQuery, state: FSMContext):
     security.admin_sessions.logout(callback.from_user.id)
     await callback.message.edit_text(
         "👋 از پنل مدیریت خارج شدید.",
-        reply_markup=keyboards.main_menu_keyboard(),
+        reply_markup=await keyboards.main_menu_keyboard_for(callback.from_user.id),
     )
 
 
@@ -352,11 +417,8 @@ async def field_add_name(message: Message, state: FSMContext):
             await message.answer(f"❌ نام «{name}» باید حداقل ۲ کاراکتر باشد. دوباره ارسال کنید:")
             return
 
-    # Create all fields
-    created = []
-    for name in names:
-        field_id = await models.create_field(name)
-        created.append((field_id, name))
+    taken = {f["name"] for f in await models.get_fields(active_only=False)}
+    created, skipped = await _bulk_create(names, models.create_field, taken)
 
     await state.clear()
 
@@ -374,9 +436,17 @@ async def field_add_name(message: Message, state: FSMContext):
     )
 
     names_text = "\n".join(f"  📚 {escape_html(n)}" for _, n in created)
+    skipped_text = (
+        "\n\n⚠️ <b>نادیده گرفته شد (تکراری):</b>\n"
+        + "\n".join(f"  • {escape_html(n)}" for n in skipped)
+        if skipped else ""
+    )
+    headline = (
+        f"✅ <b>{len(created)} رشته با موفقیت اضافه شد:</b>"
+        if created else "⚠️ هیچ رشته جدیدی اضافه نشد:"
+    )
     await message.answer(
-        f"✅ <b>{len(created)} رشته با موفقیت اضافه شد:</b>\n\n"
-        f"{names_text}",
+        f"{headline}\n\n{names_text}{skipped_text}",
         reply_markup=kb.as_markup(),
         parse_mode="HTML",
     )
@@ -571,7 +641,7 @@ async def admin_subjects_handler(callback: CallbackQuery):
     if not fields:
         await callback.message.edit_text(
             "📚 هیچ رشته‌ای ثبت نشده است. ابتدا رشته اضافه کنید.",
-            reply_markup=keyboards.admin_main_menu_keyboard(),
+            reply_markup=await keyboards.admin_main_menu_keyboard_for(callback.from_user.id),
             parse_mode="HTML",
         )
         return
@@ -605,7 +675,7 @@ async def admin_chapters_handler(callback: CallbackQuery):
     if not fields:
         await callback.message.edit_text(
             "📚 هیچ رشته‌ای ثبت نشده است. ابتدا رشته اضافه کنید.",
-            reply_markup=keyboards.admin_main_menu_keyboard(),
+            reply_markup=await keyboards.admin_main_menu_keyboard_for(callback.from_user.id),
             parse_mode="HTML",
         )
         return
@@ -821,7 +891,7 @@ async def note_edit_title(message: Message, state: FSMContext):
 
     await message.answer(
         f"✅ عنوان جزوه به «<b>{escape_html(title)}</b>» تغییر یافت.",
-        reply_markup=keyboards.admin_main_menu_keyboard(),
+        reply_markup=await keyboards.admin_main_menu_keyboard_for(message.from_user.id),
         parse_mode="HTML",
     )
     await models.add_log(
@@ -972,10 +1042,10 @@ async def subject_add_name(message: Message, state: FSMContext):
             await message.answer(f"❌ نام «{name}» باید حداقل ۲ کاراکتر باشد. دوباره ارسال کنید:")
             return
 
-    created = []
-    for name in names:
-        subject_id = await models.create_subject(field_id, name)
-        created.append((subject_id, name))
+    existing = await models.get_subjects_by_field(field_id, active_only=False)
+    taken = {s["name"] for s in existing}
+    created, skipped = await _bulk_create(
+        names, lambda n: models.create_subject(field_id, n), taken)
 
     field = await models.get_field_by_id(field_id)
     await state.clear()
@@ -994,9 +1064,17 @@ async def subject_add_name(message: Message, state: FSMContext):
     )
 
     names_text = "\n".join(f"  📖 {escape_html(n)}" for _, n in created)
+    skipped_text = (
+        "\n\n⚠️ <b>نادیده گرفته شد (تکراری):</b>\n"
+        + "\n".join(f"  • {escape_html(n)}" for n in skipped)
+        if skipped else ""
+    )
+    headline = (
+        f"✅ <b>{len(created)} درس به رشته «{escape_html(field['name'])}» اضافه شد:</b>"
+        if created else "⚠️ هیچ درس جدیدی اضافه نشد:"
+    )
     await message.answer(
-        f"✅ <b>{len(created)} درس به رشته «{escape_html(field['name'])}» اضافه شد:</b>\n\n"
-        f"{names_text}",
+        f"{headline}\n\n{names_text}{skipped_text}",
         reply_markup=kb.as_markup(),
         parse_mode="HTML",
     )
@@ -1143,11 +1221,18 @@ async def chapter_add_name(message: Message, state: FSMContext):
             await message.answer(f"❌ نام «{name}» باید حداقل ۲ کاراکتر باشد. دوباره ارسال کنید:")
             return
 
-    created = []
-    for name in names:
-        chapters = await models.get_chapters_by_subject(subject_id)
-        chapter_id = await models.create_chapter(subject_id, name, sort_order=len(chapters))
-        created.append((chapter_id, name))
+    existing = await models.get_chapters_by_subject(subject_id, active_only=False)
+    taken = {c["name"] for c in existing}
+    next_order = len(existing)
+
+    async def _create_chapter(name: str) -> int:
+        nonlocal next_order
+        chapter_id = await models.create_chapter(
+            subject_id, name, sort_order=next_order)
+        next_order += 1
+        return chapter_id
+
+    created, skipped = await _bulk_create(names, _create_chapter, taken)
 
     subject = await models.get_subject_by_id(subject_id)
     await state.clear()
@@ -1166,9 +1251,17 @@ async def chapter_add_name(message: Message, state: FSMContext):
     )
 
     names_text = "\n".join(f"  📕 {escape_html(n)}" for _, n in created)
+    skipped_text = (
+        "\n\n⚠️ <b>نادیده گرفته شد (تکراری):</b>\n"
+        + "\n".join(f"  • {escape_html(n)}" for n in skipped)
+        if skipped else ""
+    )
+    headline = (
+        f"✅ <b>{len(created)} فصل به درس «{escape_html(subject['name'])}» اضافه شد:</b>"
+        if created else "⚠️ هیچ فصل جدیدی اضافه نشد:"
+    )
     await message.answer(
-        f"✅ <b>{len(created)} فصل به درس «{escape_html(subject['name'])}» اضافه شد:</b>\n\n"
-        f"{names_text}",
+        f"{headline}\n\n{names_text}{skipped_text}",
         reply_markup=kb.as_markup(),
         parse_mode="HTML",
     )
@@ -1265,7 +1358,10 @@ async def admin_notes_handler(callback: CallbackQuery):
     await callback.message.edit_text(
         "📄 <b>مدیریت جزوه‌ها</b>\n\n"
         "جزوه موردنظر را انتخاب کنید:",
-        reply_markup=keyboards.notes_list_keyboard(notes),
+        # has_more must be passed or the "next page" button never appears and
+        # everything past the first 20 notes is unreachable
+        reply_markup=keyboards.notes_list_keyboard(
+            notes, page=0, has_more=len(notes) == 20),
         parse_mode="HTML",
     )
 
@@ -1319,15 +1415,25 @@ async def note_download_handler(callback: CallbackQuery):
     file_type = note["file_type"]
     try:
         if file_type == "photo":
-            await callback.message.answer_photo(note["file_id"], caption=f"📄 {note['title']}")
+            await callback.message.answer_photo(
+                note["file_id"], caption=f"📄 {escape_html(note['title'])}"
+            )
         elif file_type == "video":
-            await callback.message.answer_video(note["file_id"], caption=f"📄 {note['title']}")
+            await callback.message.answer_video(
+                note["file_id"], caption=f"📄 {escape_html(note['title'])}"
+            )
         elif file_type in ("document", "audio"):
-            await callback.message.answer_document(note["file_id"], caption=f"📄 {note['title']}")
+            await callback.message.answer_document(
+                note["file_id"], caption=f"📄 {escape_html(note['title'])}"
+            )
         elif file_type == "voice":
-            await callback.message.answer_voice(note["file_id"], caption=f"📄 {note['title']}")
+            await callback.message.answer_voice(
+                note["file_id"], caption=f"📄 {escape_html(note['title'])}"
+            )
         else:
-            await callback.message.answer_document(note["file_id"], caption=f"📄 {note['title']}")
+            await callback.message.answer_document(
+                note["file_id"], caption=f"📄 {escape_html(note['title'])}"
+            )
     except Exception as e:
         await callback.answer(f"❌ خطا در ارسال فایل: {e}", show_alert=True)
 
@@ -1360,18 +1466,22 @@ async def note_delete_handler(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("approve:"))
 async def approve_note_handler(callback: CallbackQuery):
     """Approve a pending note."""
-    await callback.answer()
     note_id = int(callback.data.split(":")[1])
     note = await models.get_note_by_id(note_id)
-    if not note:
-        await callback.answer("❌ جزوه یافت نشد!", show_alert=True)
+    if not note or note["status"] != "pending" or not note["is_active"]:
+        await callback.answer("این درخواست دیگر در انتظار بررسی نیست.", show_alert=True)
         return
 
-    await models.approve_note(note_id, callback.from_user.id)
+    if not await models.review_pending_note(
+        note_id, callback.from_user.id, "approved"
+    ):
+        await callback.answer("این درخواست قبلاً بررسی شده است.", show_alert=True)
+        return
+    await callback.answer("جزوه تأیید شد.")
     await callback.message.edit_text(
         f"✅ جزوه شماره {note_id} تأیید شد.\n\n"
-        f"📄 {note['title']}",
-        reply_markup=keyboards.admin_main_menu_keyboard(),
+        f"📄 {escape_html(note['title'])}",
+        reply_markup=await keyboards.admin_main_menu_keyboard_for(callback.from_user.id),
         parse_mode="HTML",
     )
     await models.add_log(
@@ -1384,7 +1494,7 @@ async def approve_note_handler(callback: CallbackQuery):
         await bot.send_message(
             note["submitted_by"],
             f"✅ <b>جزوه شما تأیید شد!</b>\n\n"
-            f"📄 {note['title']}\n\n"
+            f"📄 {escape_html(note['title'])}\n\n"
             "جزوه شما در سیستم ثبت و در دسترس کاربران قرار گرفت.",
             parse_mode="HTML",
         )
@@ -1395,18 +1505,22 @@ async def approve_note_handler(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("reject:"))
 async def reject_note_handler(callback: CallbackQuery):
     """Reject a pending note."""
-    await callback.answer()
     note_id = int(callback.data.split(":")[1])
     note = await models.get_note_by_id(note_id)
-    if not note:
-        await callback.answer("❌ جزوه یافت نشد!", show_alert=True)
+    if not note or note["status"] != "pending" or not note["is_active"]:
+        await callback.answer("این درخواست دیگر در انتظار بررسی نیست.", show_alert=True)
         return
 
-    await models.reject_note(note_id, callback.from_user.id)
+    if not await models.review_pending_note(
+        note_id, callback.from_user.id, "rejected"
+    ):
+        await callback.answer("این درخواست قبلاً بررسی شده است.", show_alert=True)
+        return
+    await callback.answer("جزوه رد شد.")
     await callback.message.edit_text(
         f"❌ جزوه شماره {note_id} رد شد.\n\n"
-        f"📄 {note['title']}",
-        reply_markup=keyboards.admin_main_menu_keyboard(),
+        f"📄 {escape_html(note['title'])}",
+        reply_markup=await keyboards.admin_main_menu_keyboard_for(callback.from_user.id),
         parse_mode="HTML",
     )
     await models.add_log(
@@ -1419,7 +1533,7 @@ async def reject_note_handler(callback: CallbackQuery):
         await bot.send_message(
             note["submitted_by"],
             f"❌ <b>جزوه شما رد شد.</b>\n\n"
-            f"📄 {note['title']}\n\n"
+            f"📄 {escape_html(note['title'])}\n\n"
             "متأسفانه جزوه شما تأیید نشد.",
             parse_mode="HTML",
         )
@@ -1430,31 +1544,61 @@ async def reject_note_handler(callback: CallbackQuery):
 @router.callback_query(F.data == "admin_pending")
 async def admin_pending_handler(callback: CallbackQuery):
     """Show pending notes."""
+    await _show_pending_notes(callback, page=0)
+
+
+async def _show_pending_notes(callback: CallbackQuery, page: int) -> None:
     await callback.answer()
-    notes = await models.get_pending_notes()
+    page_size = 20
+    notes = await models.get_pending_notes(limit=page_size + 1, offset=page * page_size)
     if not notes:
         await callback.message.edit_text(
             "✅ هیچ جزوه در انتظار تأییدی وجود ندارد.",
-            reply_markup=keyboards.admin_main_menu_keyboard(),
+            reply_markup=await keyboards.admin_main_menu_keyboard_for(callback.from_user.id),
             parse_mode="HTML",
         )
         return
 
-    text = "⏳ <b>جزوه‌های در انتظار تأیید</b>\n\n"
-    for note in notes:
-        field = note.get("field_name", "")
-        subject = note.get("subject_name", "")
-        chapter = note.get("chapter_name", "بدون فصل")
-        text += (
-            f"📄 <b>{note['title']}</b>\n"
-            f"📚 {field} → 📖 {subject} → 📕 {chapter}\n"
-            f"👤 {note['submitted_by_name']}\n"
-            f"─────────────────\n"
-        )
-
+    has_more = len(notes) > page_size
+    notes = notes[:page_size]
     await callback.message.edit_text(
-        text,
-        reply_markup=keyboards.admin_main_menu_keyboard(),
+        f"⏳ <b>درخواست‌های جزوه در انتظار تأیید</b>\n"
+        f"صفحه {page + 1} — برای بررسی، روی یک درخواست بزنید:",
+        reply_markup=keyboards.pending_notes_keyboard(notes, page, has_more),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("admin_pending_page:"))
+async def admin_pending_page_handler(callback: CallbackQuery):
+    page = int(callback.data.split(":")[1])
+    if page < 0:
+        await callback.answer("صفحه نامعتبر است.", show_alert=True)
+        return
+    await _show_pending_notes(callback, page)
+
+
+@router.callback_query(F.data.startswith("pending_note:"))
+async def pending_note_detail_handler(callback: CallbackQuery):
+    _, raw_note_id, raw_page = callback.data.split(":")
+    note_id, page = int(raw_note_id), int(raw_page)
+    note = await models.get_note_by_id(note_id)
+    if not note or note["status"] != "pending" or not note["is_active"]:
+        await callback.answer("این درخواست دیگر در انتظار بررسی نیست.", show_alert=True)
+        return
+    field = await models.get_field_by_id(note["field_id"])
+    subject = await models.get_subject_by_id(note["subject_id"])
+    chapter = await models.get_chapter_by_id(note["chapter_id"]) if note["chapter_id"] else None
+    note_data = dict(note)
+    note_data.update({
+        "field_name": field["name"] if field else "",
+        "subject_name": subject["name"] if subject else "",
+        "chapter_name": chapter["name"] if chapter else "بدون فصل",
+    })
+    await callback.answer()
+    await callback.message.edit_text(
+        format_note_info(note_data),
+        reply_markup=keyboards.pending_note_detail_keyboard(note_id, page),
         parse_mode="HTML",
     )
 
@@ -1489,11 +1633,41 @@ async def admin_add_handler(callback: CallbackQuery, state: FSMContext):
 
 @router.message(StateFilter(AdminAddFlow.entering_user_id))
 async def admin_add_user_id(message: Message, state: FSMContext):
-    """Get new admin's Telegram ID."""
+    """Get new admin's Telegram ID (or promote an existing admin to Owner)."""
     try:
         user_id = int(message.text.strip())
     except ValueError:
         await message.answer("❌ ID باید عددی باشد. دوباره ارسال کنید:")
+        return
+
+    data = await state.get_data()
+
+    # 👑 Owner promotion targets an EXISTING admin - checking "already an
+    # admin" here used to reject exactly the ID the prompt asks for.
+    if data.get("promote_to_owner"):
+        existing = await models.get_admin_by_user_id(user_id)
+        if not existing:
+            await message.answer(
+                "❌ این کاربر ادمین نیست. اول او را از «👤 ادمین‌ها» اضافه کنید، "
+                "سپس اینجا ارتقا دهید:")
+            return
+        if existing["is_main_admin"]:
+            await message.answer("ℹ️ این کاربر از قبل Owner است. ID دیگری ارسال کنید:")
+            return
+        await models.set_admin_owner(existing["id"], True)
+        await state.clear()
+        await message.answer(
+            f"👑 <b>ارتقا انجام شد</b>\n\n"
+            f"👤 {escape_html(existing['full_name'] or existing['username'] or '')}\n"
+            f"🆔 ID: <code>{user_id}</code>\n\n"
+            "این کاربر حالا Owner است و به همه بخش‌ها دسترسی دارد.",
+            reply_markup=await keyboards.admin_main_menu_keyboard_for(message.from_user.id),
+            parse_mode="HTML",
+        )
+        await models.add_log(
+            message.from_user.id, message.from_user.username or "",
+            "promote_owner", f"user {user_id}")
+        logger.info(f"Admin {user_id} promoted to owner by {message.from_user.id}")
         return
 
     # Check if already an admin
@@ -1560,7 +1734,7 @@ async def admin_add_password(message: Message, state: FSMContext):
         f"👤 نام: {data['new_admin_full_name']}\n"
         f"📛 Username: @{data['new_admin_username']}\n\n"
         f"دسترسی‌های پیش‌فرض اعمال شدند.",
-        reply_markup=keyboards.admin_main_menu_keyboard(),
+        reply_markup=await keyboards.admin_main_menu_keyboard_for(message.from_user.id),
         parse_mode="HTML",
     )
     await models.add_log(
@@ -1634,7 +1808,7 @@ async def admin_change_password(message: Message, state: FSMContext):
 
     await message.answer(
         "✅ رمز عبور با موفقیت تغییر کرد.",
-        reply_markup=keyboards.admin_main_menu_keyboard(),
+        reply_markup=await keyboards.admin_main_menu_keyboard_for(message.from_user.id),
         parse_mode="HTML",
     )
     await models.add_log(
@@ -1763,14 +1937,16 @@ async def logs_pdf_handler(callback: CallbackQuery):
     doc.save(docx_path)
     try:
         out_pdf = convert.word_to_pdf(docx_path, out_dir)
-        await callback.message.answer_document(out_pdf, caption="📤 خروجی PDF لاگ‌ها")
+        await callback.message.answer_document(
+            FSInputFile(out_pdf), caption="📤 خروجی PDF لاگ‌ها")
         docx_path.unlink(missing_ok=True)
         out_pdf.unlink(missing_ok=True)
         await models.add_log(callback.from_user.id, callback.from_user.username or "",
                              "export_logs_pdf", f"{len(logs)} rows")
     except RuntimeError as e:
         # LibreOffice missing -> send the DOCX so the admin still gets output
-        await callback.message.answer_document(docx_path, caption=f"📤 خروجی لاگ‌ها (Word)\n{e}")
+        await callback.message.answer_document(
+            FSInputFile(docx_path), caption=f"📤 خروجی لاگ‌ها (Word)\n{e}")
         docx_path.unlink(missing_ok=True)
     except Exception as e:
         await callback.answer(f"❌ خطا در تولید خروجی: {e}", show_alert=True)
@@ -1942,7 +2118,7 @@ async def admin_logs_handler(callback: CallbackQuery):
     if not logs:
         await callback.message.edit_text(
             "📋 هیچ لاگی ثبت نشده است.",
-            reply_markup=keyboards.admin_main_menu_keyboard(),
+            reply_markup=await keyboards.admin_main_menu_keyboard_for(callback.from_user.id),
             parse_mode="HTML",
         )
         return
@@ -2014,31 +2190,639 @@ async def setting_stats_handler(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin_schedule")
 async def admin_schedule_handler(callback: CallbackQuery):
-    """Show weekly schedule management menu."""
+    """Show track-specific weekly timetable management."""
     await callback.answer()
     await callback.message.edit_text(
         "🗓 <b>مدیریت برنامه هفتگی کلاس</b>\n\n"
-        "برنامه به‌صورت ۷ روز (ردیف) × ۷ زنگ (ستون) تعریف می‌شود و برای همه دانش‌آموزان نمایش داده می‌شود.",
+        "برنامه هر رشته و هر روز را جداگانه مدیریت کنید. "
+        "هر کلاس رکورد مستقلی دارد و ثبت چند کلاس در یک روز مجاز است.",
         reply_markup=keyboards.admin_schedule_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+WEEKLY_TRACKS = models.WEEKLY_TRACKS
+WEEKLY_PAGE_SIZE = 5
+
+
+def _weekly_track_keyboard(prefix: str, suffix: str = ""):
+    kb = InlineKeyboardBuilder()
+    for track_key, (emoji, title) in WEEKLY_TRACKS.items():
+        kb.row(InlineKeyboardButton(
+            text=f"{emoji} رشته {title}",
+            callback_data=f"{prefix}:{track_key}{suffix}",
+        ))
+    kb.row(InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin_schedule"))
+    return kb.as_markup()
+
+
+def _weekly_day_keyboard(prefix: str, key: str):
+    kb = InlineKeyboardBuilder()
+    for day_index, day in enumerate(models.DAYS_FA):
+        kb.row(InlineKeyboardButton(
+            text=day,
+            callback_data=f"{prefix}:{key}:{day_index}",
+        ))
+    kb.row(InlineKeyboardButton(text="🔙 انتخاب رشته دیگر", callback_data="admin_schedule"))
+    return kb.as_markup()
+
+
+def _weekly_class_summary(
+    track_key: str,
+    day_index: int,
+    data: dict,
+    heading: str = "📋 <b>جزئیات کلاس</b>",
+) -> str:
+    _, track = WEEKLY_TRACKS[track_key]
+    return (
+        f"{heading}\n\n"
+        f"📐 رشته: {track}\n"
+        f"🗓 روز: {models.DAYS_FA[day_index]}\n"
+        f"📖 نام کلاس: {escape_html(data['weekly_name'])}\n"
+        f"⏰ ساعت شروع: {data['weekly_start']}\n"
+        f"⏰ ساعت پایان: {data['weekly_end']}"
+    )
+
+
+def _time_minutes(value: str) -> int:
+    return models.weekly_time_minutes(value)
+
+
+async def _weekly_overlap_warning(
+    track_key: str, day_index: int, start: str, end: str, exclude_id: int | None = None
+) -> str:
+    start_min, end_min = _time_minutes(start), _time_minutes(end)
+    conflicts = []
+    for item in await models.get_weekly_classes(track_key, day_index):
+        if exclude_id is not None and item["id"] == exclude_id:
+            continue
+        if start_min < _time_minutes(item["end_time"]) and _time_minutes(
+            item["start_time"]
+        ) < end_min:
+            conflicts.append(item)
+    if not conflicts:
+        return ""
+    labels = ", ".join(
+        f"{escape_html(item['class_name'])} ({item['start_time']}-{item['end_time']})"
+        for item in conflicts[:3]
+    )
+    return f"\n\n⚠️ <b>هشدار تداخل زمانی:</b> {labels}\nمی‌توانید با تأیید خود ادامه دهید."
+
+
+@router.callback_query(F.data == "weekly_cancel")
+async def weekly_cancel_handler(callback: CallbackQuery, state: FSMContext):
+    await callback.answer("عملیات لغو شد.")
+    await state.clear()
+    await callback.message.edit_text(
+        "🗓 <b>مدیریت برنامه هفتگی کلاس</b>\n\n"
+        "هر کلاس را مستقل از رشته و روز ثبت و مدیریت کنید.",
+        reply_markup=keyboards.admin_schedule_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "weekly_add")
+async def weekly_add_handler(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(WeeklyClassFlow.selecting_track)
+    await state.set_data({"weekly_operation": "add"})
+    await callback.message.edit_text(
+        "➕ <b>افزودن کلاس به برنامه هفتگی</b>\n\nرشته را انتخاب کنید:",
+        reply_markup=_weekly_track_keyboard("weekly_add_track"),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("weekly_add_track:"))
+async def weekly_add_track_handler(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    track_key = callback.data.split(":", 1)[1]
+    if track_key not in WEEKLY_TRACKS:
+        await callback.answer("رشته انتخاب‌شده معتبر نیست.", show_alert=True)
+        return
+    await state.update_data(weekly_track=track_key)
+    await state.set_state(WeeklyClassFlow.selecting_day)
+    _, track = WEEKLY_TRACKS[track_key]
+    await callback.message.edit_text(
+        f"➕ افزودن کلاس — رشته {track}\n\nروز هفته را انتخاب کنید:",
+        reply_markup=_weekly_day_keyboard("weekly_add_day", track_key),
+    )
+
+
+@router.callback_query(F.data.startswith("weekly_add_day:"))
+async def weekly_add_day_handler(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    _, track_key, day_value = callback.data.split(":")
+    if track_key not in WEEKLY_TRACKS or not day_value.isdigit():
+        await callback.answer("رشته یا روز انتخاب‌شده معتبر نیست.", show_alert=True)
+        return
+    day_index = int(day_value)
+    if not 0 <= day_index < len(models.DAYS_FA):
+        await callback.answer("روز انتخاب‌شده معتبر نیست.", show_alert=True)
+        return
+    await state.update_data(weekly_track=track_key, weekly_day=day_index)
+    await state.set_state(WeeklyClassFlow.entering_name)
+    await callback.message.edit_text(
+        "📖 نام کلاس را وارد کنید (۲ تا ۱۰۰ نویسه):",
+        reply_markup=keyboards.cancel_keyboard("weekly_cancel"),
+    )
+
+
+@router.message(StateFilter(WeeklyClassFlow.entering_name), F.text)
+async def weekly_add_name_handler(message: Message, state: FSMContext):
+    name = message.text.strip()
+    if not 2 <= len(name) <= 100:
+        await message.answer("❌ نام کلاس باید بین ۲ تا ۱۰۰ نویسه باشد. دوباره وارد کنید:")
+        return
+    await state.update_data(weekly_name=name)
+    await state.set_state(WeeklyClassFlow.entering_start)
+    data = await state.get_data()
+    prompt = (
+        f"ساعت شروع فعلی: {data['weekly_start']}\n"
+        "⏰ ساعت شروع جدید را با قالب HH:MM وارد کنید:"
+        if data.get("weekly_edit_id")
+        else "⏰ ساعت شروع کلاس را به قالب ۲۴ ساعته HH:MM وارد کنید (مثال: 08:00):"
+    )
+    await message.answer(
+        prompt,
+        reply_markup=keyboards.cancel_keyboard("weekly_cancel"),
+    )
+
+
+@router.message(StateFilter(WeeklyClassFlow.entering_start), F.text)
+async def weekly_add_start_handler(message: Message, state: FSMContext):
+    value = message.text.strip()
+    try:
+        _time_minutes(value)
+    except ValueError as exc:
+        await message.answer(f"❌ {exc}")
+        return
+    await state.update_data(weekly_start=value)
+    await state.set_state(WeeklyClassFlow.entering_end)
+    data = await state.get_data()
+    prompt = (
+        f"ساعت پایان فعلی: {data['weekly_end']}\n"
+        "⏰ ساعت پایان جدید را با قالب HH:MM وارد کنید:"
+        if data.get("weekly_edit_id")
+        else "⏰ ساعت پایان کلاس را به قالب ۲۴ ساعته HH:MM وارد کنید (مثال: 09:30):"
+    )
+    await message.answer(
+        prompt,
+        reply_markup=keyboards.cancel_keyboard("weekly_cancel"),
+    )
+
+
+async def _show_weekly_confirmation(message: Message, state: FSMContext):
+    data = await state.get_data()
+    track_key, day_index = data["weekly_track"], int(data["weekly_day"])
+    warning = await _weekly_overlap_warning(
+        track_key, day_index, data["weekly_start"], data["weekly_end"],
+        exclude_id=data.get("weekly_edit_id"),
+    )
+    kb = InlineKeyboardBuilder()
+    confirm_callback = (
+        "weekly_edit_confirm" if data.get("weekly_edit_id") else "weekly_add_confirm"
+    )
+    kb.row(InlineKeyboardButton(text="✅ تأیید و ثبت", callback_data=confirm_callback))
+    kb.row(InlineKeyboardButton(text="✏️ اصلاح اطلاعات", callback_data="weekly_correct"))
+    kb.row(InlineKeyboardButton(text="❌ لغو عملیات", callback_data="weekly_cancel"))
+    await state.set_state(WeeklyClassFlow.confirming)
+    await message.answer(
+        _weekly_class_summary(
+            track_key, day_index, data, "📋 <b>تأیید ثبت کلاس</b>"
+        ) + warning,
+        reply_markup=kb.as_markup(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(StateFilter(WeeklyClassFlow.entering_end), F.text)
+async def weekly_add_end_handler(message: Message, state: FSMContext):
+    value = message.text.strip()
+    try:
+        end_minute = _time_minutes(value)
+        data = await state.get_data()
+        start_minute = _time_minutes(data["weekly_start"])
+        if start_minute >= end_minute:
+            raise ValueError("ساعت شروع باید زودتر از ساعت پایان باشد.")
+    except ValueError as exc:
+        await message.answer(f"❌ {exc} دوباره وارد کنید:")
+        return
+    await state.update_data(weekly_end=value, weekly_submission_key=uuid.uuid4().hex)
+    await _show_weekly_confirmation(message, state)
+
+
+@router.callback_query(F.data == "weekly_correct")
+async def weekly_correct_handler(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    data = await state.get_data()
+    await state.set_state(WeeklyClassFlow.entering_name)
+    await callback.message.answer(
+        "📖 اطلاعات را از نام کلاس اصلاح کنید. نام جدید را وارد کنید:",
+        reply_markup=keyboards.cancel_keyboard("weekly_cancel"),
+    )
+    if data.get("weekly_edit_id"):
+        await state.update_data(weekly_correcting=True)
+
+
+@router.callback_query(F.data == "weekly_add_confirm")
+async def weekly_add_confirm_handler(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if data.get("weekly_operation") != "add" or not data.get("weekly_submission_key"):
+        await callback.answer("این درخواست ثبت دیگر معتبر نیست.", show_alert=True)
+        return
+    class_id = await models.add_weekly_class(
+        data["weekly_track"],
+        int(data["weekly_day"]),
+        data["weekly_name"],
+        data["weekly_start"],
+        data["weekly_end"],
+        data["weekly_submission_key"],
+    )
+    await state.clear()
+    await callback.answer("کلاس ثبت شد.")
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="➕ افزودن کلاس دیگر", callback_data="weekly_add"))
+    kb.row(InlineKeyboardButton(text="📋 مدیریت برنامه‌ها", callback_data="admin_schedule"))
+    await callback.message.edit_text(
+        f"✅ کلاس «{escape_html(data['weekly_name'])}» با شناسه {class_id} "
+        "با موفقیت به برنامه هفتگی اضافه شد.",
+        reply_markup=kb.as_markup(),
+        parse_mode="HTML",
+    )
+    await models.add_log(
+        callback.from_user.id, callback.from_user.username or "",
+        "add_weekly_class",
+        f"id={class_id} track={data['weekly_track']} day={data['weekly_day']}",
+    )
+
+
+@router.callback_query(F.data == "weekly_edit_confirm")
+async def weekly_edit_confirm_handler(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    class_id = data.get("weekly_edit_id")
+    if not class_id:
+        await callback.answer("کلاس برای ویرایش مشخص نشده است.", show_alert=True)
+        return
+    updated = await models.update_weekly_class(
+        int(class_id),
+        track_key=data["weekly_track"],
+        day_index=int(data["weekly_day"]),
+        class_name=data["weekly_name"],
+        start_time=data["weekly_start"],
+        end_time=data["weekly_end"],
+    )
+    if not updated:
+        await callback.answer("این کلاس دیگر وجود ندارد.", show_alert=True)
+        await state.clear()
+        return
+    await state.clear()
+    await callback.answer("تغییرات ذخیره شد.")
+    await models.add_log(
+        callback.from_user.id, callback.from_user.username or "",
+        "edit_weekly_class", f"id={class_id}",
+    )
+    await callback.message.edit_text(
+        "✅ تغییرات کلاس با موفقیت ذخیره شد.",
+        reply_markup=keyboards.admin_schedule_keyboard(),
+    )
+
+
+def _weekly_admin_selection(callback: CallbackQuery, action: str, track_key: str):
+    return callback.message.edit_text(
+        f"📋 رشته {WEEKLY_TRACKS[track_key][1]} — روز موردنظر را انتخاب کنید:",
+        reply_markup=_weekly_day_keyboard(f"weekly_{action}_day", track_key),
+    )
+
+
+@router.callback_query(F.data == "weekly_view")
+async def weekly_view_handler(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text(
+        "📋 <b>مشاهده برنامه‌های ثبت‌شده</b>\n\nرشته را انتخاب کنید:",
+        reply_markup=_weekly_track_keyboard("weekly_view_track"),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("weekly_view_track:"))
+async def weekly_view_track_handler(callback: CallbackQuery):
+    await callback.answer()
+    track_key = callback.data.split(":", 1)[1]
+    if track_key not in WEEKLY_TRACKS:
+        await callback.answer("رشته معتبر نیست.", show_alert=True)
+        return
+    await _weekly_admin_selection(callback, "view", track_key)
+
+
+@router.callback_query(F.data.startswith("weekly_view_day:"))
+async def weekly_view_day_handler(callback: CallbackQuery):
+    await callback.answer()
+    _, track_key, day_value = callback.data.split(":")
+    await _show_weekly_admin_classes(callback, track_key, int(day_value), "view", 0)
+
+
+@router.callback_query(F.data.startswith("weekly_view_page:"))
+async def weekly_view_page_handler(callback: CallbackQuery):
+    await callback.answer()
+    _, track_key, day_value, page_value = callback.data.split(":")
+    await _show_weekly_admin_classes(
+        callback, track_key, int(day_value), "view", int(page_value)
+    )
+
+
+@router.callback_query(F.data == "weekly_edit")
+async def weekly_edit_handler(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text(
+        "✏️ <b>ویرایش کلاس</b>\n\nرشته را انتخاب کنید:",
+        reply_markup=_weekly_track_keyboard("weekly_edit_track"),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("weekly_edit_track:"))
+async def weekly_edit_track_handler(callback: CallbackQuery):
+    await callback.answer()
+    track_key = callback.data.split(":", 1)[1]
+    if track_key not in WEEKLY_TRACKS:
+        await callback.answer("رشته معتبر نیست.", show_alert=True)
+        return
+    await _weekly_admin_selection(callback, "edit", track_key)
+
+
+@router.callback_query(F.data.startswith("weekly_edit_day:"))
+async def weekly_edit_day_handler(callback: CallbackQuery):
+    await callback.answer()
+    _, track_key, day_value = callback.data.split(":")
+    await _show_weekly_admin_classes(callback, track_key, int(day_value), "edit", 0)
+
+
+@router.callback_query(F.data.startswith("weekly_edit_list:"))
+async def weekly_edit_page_handler(callback: CallbackQuery):
+    await callback.answer()
+    _, track_key, day_value, page_value = callback.data.split(":")
+    await _show_weekly_admin_classes(
+        callback, track_key, int(day_value), "edit", int(page_value)
+    )
+
+
+@router.callback_query(F.data.startswith("weekly_edit_class:"))
+async def weekly_edit_class_handler(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    class_id = int(callback.data.split(":")[1])
+    item = await models.get_weekly_class(class_id)
+    if item is None:
+        await callback.answer("کلاس یافت نشد.", show_alert=True)
+        return
+    await state.set_state(WeeklyClassFlow.selecting_track)
+    await state.set_data({
+        "weekly_operation": "edit",
+        "weekly_edit_id": class_id,
+        "weekly_track": item["track_key"],
+        "weekly_day": item["day_index"],
+        "weekly_name": item["class_name"],
+        "weekly_start": item["start_time"],
+        "weekly_end": item["end_time"],
+    })
+    await callback.message.edit_text(
+        f"✏️ ویرایش «{escape_html(item['class_name'])}»\n\n"
+        "رشته‌ی کلاس را انتخاب کنید (رشته فعلی هم قابل انتخاب است):",
+        reply_markup=_weekly_track_keyboard("weekly_edit_choose_track", f":{class_id}"),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("weekly_edit_choose_track:"))
+async def weekly_edit_choose_track_handler(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    _, track_key, class_id = callback.data.split(":")
+    data = await state.get_data()
+    if data.get("weekly_edit_id") != int(class_id) or track_key not in WEEKLY_TRACKS:
+        await callback.answer("فرایند ویرایش منقضی یا نامعتبر است.", show_alert=True)
+        return
+    await state.update_data(weekly_track=track_key)
+    await state.set_state(WeeklyClassFlow.selecting_day)
+    _, label = WEEKLY_TRACKS[track_key]
+    await callback.message.edit_text(
+        f"رشته: {label}\n\nروز جدید کلاس را انتخاب کنید:",
+        reply_markup=_weekly_day_keyboard("weekly_edit_choose_day", str(class_id)),
+    )
+
+
+@router.callback_query(F.data.startswith("weekly_edit_choose_day:"))
+async def weekly_edit_choose_day_handler(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    _, class_id, day_value = callback.data.split(":")
+    data = await state.get_data()
+    if data.get("weekly_edit_id") != int(class_id) or not day_value.isdigit():
+        await callback.answer("فرایند ویرایش منقضی یا نامعتبر است.", show_alert=True)
+        return
+    day_index = int(day_value)
+    if not 0 <= day_index < len(models.DAYS_FA):
+        await callback.answer("روز نامعتبر است.", show_alert=True)
+        return
+    await state.update_data(weekly_day=day_index)
+    await state.set_state(WeeklyClassFlow.entering_name)
+    await callback.message.answer(
+        f"نام فعلی: {escape_html(data['weekly_name'])}\n"
+        "📖 نام جدید کلاس را وارد کنید:",
+        reply_markup=keyboards.cancel_keyboard("weekly_cancel"),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "weekly_delete")
+async def weekly_delete_handler(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text(
+        "🗑 <b>حذف کلاس از برنامه</b>\n\nرشته را انتخاب کنید:",
+        reply_markup=_weekly_track_keyboard("weekly_delete_track"),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("weekly_delete_track:"))
+async def weekly_delete_track_handler(callback: CallbackQuery):
+    await callback.answer()
+    track_key = callback.data.split(":", 1)[1]
+    if track_key not in WEEKLY_TRACKS:
+        await callback.answer("رشته معتبر نیست.", show_alert=True)
+        return
+    await _weekly_admin_selection(callback, "delete", track_key)
+
+
+@router.callback_query(F.data.startswith("weekly_delete_day:"))
+async def weekly_delete_day_handler(callback: CallbackQuery):
+    await callback.answer()
+    _, track_key, day_value = callback.data.split(":")
+    await _show_weekly_admin_classes(callback, track_key, int(day_value), "delete", 0)
+
+
+@router.callback_query(F.data.startswith("weekly_delete_list:"))
+async def weekly_delete_page_handler(callback: CallbackQuery):
+    await callback.answer()
+    _, track_key, day_value, page_value = callback.data.split(":")
+    await _show_weekly_admin_classes(
+        callback, track_key, int(day_value), "delete", int(page_value)
+    )
+
+
+@router.callback_query(F.data.startswith("weekly_delete_class:"))
+async def weekly_delete_class_handler(callback: CallbackQuery):
+    await callback.answer()
+    class_id = int(callback.data.split(":")[1])
+    item = await models.get_weekly_class(class_id)
+    if item is None:
+        await callback.answer("کلاس یافت نشد.", show_alert=True)
+        return
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(
+        text="🗑 بله، حذف شود",
+        callback_data=f"weekly_delete_confirm:{class_id}",
+    ))
+    kb.row(InlineKeyboardButton(
+        text="❌ انصراف",
+        callback_data=f"weekly_delete_cancel:{item['track_key']}:{item['day_index']}",
+    ))
+    await callback.message.edit_text(
+        _weekly_class_summary(
+            item["track_key"], item["day_index"],
+            {
+                "weekly_name": item["class_name"],
+                "weekly_start": item["start_time"],
+                "weekly_end": item["end_time"],
+            },
+            "🗑 <b>کلاس انتخاب‌شده برای حذف</b>",
+        ) + "\n\nحذف این کلاس تأیید می‌شود؟",
+        reply_markup=kb.as_markup(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("weekly_delete_confirm:"))
+async def weekly_delete_confirm_handler(callback: CallbackQuery):
+    class_id = int(callback.data.split(":")[1])
+    item = await models.get_weekly_class(class_id)
+    if item is None or not await models.delete_weekly_class(class_id):
+        await callback.answer("این کلاس قبلاً حذف شده یا وجود ندارد.", show_alert=True)
+        return
+    await callback.answer("کلاس حذف شد.")
+    await models.add_log(
+        callback.from_user.id, callback.from_user.username or "",
+        "delete_weekly_class", f"id={class_id}",
+    )
+    await _show_weekly_admin_classes(
+        callback, item["track_key"], item["day_index"], "delete", 0
+    )
+
+
+@router.callback_query(F.data.startswith("weekly_delete_cancel:"))
+async def weekly_delete_cancel_handler(callback: CallbackQuery):
+    await callback.answer()
+    _, track_key, day_value = callback.data.split(":")
+    await _show_weekly_admin_classes(callback, track_key, int(day_value), "delete", 0)
+
+
+async def _show_weekly_admin_classes(
+    callback: CallbackQuery,
+    track_key: str,
+    day_index: int,
+    action: str,
+    page: int,
+):
+    if track_key not in WEEKLY_TRACKS or not 0 <= day_index < len(models.DAYS_FA):
+        await callback.answer("رشته یا روز نامعتبر است.", show_alert=True)
+        return
+    classes = await models.get_weekly_classes(track_key, day_index)
+    page_count = max(1, (len(classes) + WEEKLY_PAGE_SIZE - 1) // WEEKLY_PAGE_SIZE)
+    page = min(max(page, 0), page_count - 1)
+    visible = classes[page * WEEKLY_PAGE_SIZE:(page + 1) * WEEKLY_PAGE_SIZE]
+    kb = InlineKeyboardBuilder()
+    for item in visible:
+        prefix = {
+            "view": "weekly_view_item",
+            "edit": "weekly_edit_class",
+            "delete": "weekly_delete_class",
+        }[action]
+        kb.row(InlineKeyboardButton(
+            text=f"#{item['id']} {item['start_time']} {item['class_name'][:30]}",
+            callback_data=f"{prefix}:{item['id']}",
+        ))
+    if page > 0:
+        page_callback_base = {
+            "edit": "weekly_edit_list",
+            "delete": "weekly_delete_list",
+            "view": "weekly_view_page",
+        }[action]
+        kb.button(
+            text="⬅️ قبلی",
+            callback_data=f"{page_callback_base}:{track_key}:{day_index}:{page - 1}",
+        )
+    if page + 1 < page_count:
+        page_callback_base = {
+            "edit": "weekly_edit_list",
+            "delete": "weekly_delete_list",
+            "view": "weekly_view_page",
+        }[action]
+        kb.button(
+            text="بعدی ➡️",
+            callback_data=f"{page_callback_base}:{track_key}:{day_index}:{page + 1}",
+        )
+    if page > 0 or page + 1 < page_count:
+        kb.adjust(2)
+    kb.row(InlineKeyboardButton(
+        text="🔙 روزهای دیگر",
+        callback_data=f"weekly_{action}_track:{track_key}",
+    ))
+    title = {
+        "view": "📋 برنامه ثبت‌شده",
+        "edit": "✏️ انتخاب کلاس برای ویرایش",
+        "delete": "🗑 انتخاب کلاس برای حذف",
+    }[action]
+    _, track = WEEKLY_TRACKS[track_key]
+    text = f"<b>{title}</b>\n📐 رشته: {track}\n🗓 روز: {models.DAYS_FA[day_index]}\n\n"
+    if visible:
+        text += "\n".join(
+            f"#{item['id']} — {escape_html(item['class_name'])} "
+            f"({item['start_time']} تا {item['end_time']})"
+            for item in visible
+        )
+    else:
+        text += "📭 برای این رشته و روز کلاسی ثبت نشده است."
+    if page_count > 1:
+        text += f"\n\nصفحه {page + 1} از {page_count}"
+    await callback.message.edit_text(
+        text, reply_markup=kb.as_markup(), parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data.startswith("weekly_view_item:"))
+async def weekly_view_item_handler(callback: CallbackQuery):
+    await callback.answer()
+    item = await models.get_weekly_class(int(callback.data.split(":")[1]))
+    if item is None:
+        await callback.answer("کلاس یافت نشد.", show_alert=True)
+        return
+    await callback.message.answer(
+        _weekly_class_summary(
+            item["track_key"], item["day_index"],
+            {
+                "weekly_name": item["class_name"],
+                "weekly_start": item["start_time"],
+                "weekly_end": item["end_time"],
+            },
+        ),
         parse_mode="HTML",
     )
 
 
 @router.callback_query(F.data == "admin_schedule_view")
 async def admin_schedule_view_handler(callback: CallbackQuery):
-    """Admin view: the full weekly plan as a real 8x8 glass-button grid.
-    Same table students see, shown inside the admin panel."""
-    await callback.answer()
-    from schedule import _build_grid, _schedule_kb
-    grid = await _build_grid()
-    kb = _schedule_kb(grid, admin_user=True)
-    await callback.message.edit_text(
-        "👁 <b>مشاهده برنامه هفتگی (پنل ادمین)</b>\n\n"
-        "روی هر درس کلیک کنید تا جزئیات همان زنگ را ببینید؛\n"
-        "روی نام روز برای تکالیف کامل آن روز.",
-        reply_markup=kb,
-        parse_mode="HTML",
-    )
+    """Admin view of the weekly plan: the same day-based view students get,
+    which already carries the admin edit / online-class buttons."""
+    from schedule import menu_schedule_handler
+    await menu_schedule_handler(callback)
 
 
 @router.callback_query(F.data == "sched_edit_start")
@@ -2079,8 +2863,8 @@ async def sched_edit_cell_handler(callback: CallbackQuery, state: FSMContext):
     _, fid, day, col = callback.data.split(":")
     field_id = None if fid == "None" else int(fid)
     day, col = int(day), int(col)
-    tasks = await models.get_day_tasks(field_id, day)
-    current = tasks[col - 1] if col - 1 < len(tasks) else ""
+    schedule = await models.get_schedule(field_id)
+    current = schedule.get((day, col), "")
     await state.set_state(SchedEditFlow.waiting_single_cell)
     await state.update_data(
         sched_field=field_id, sched_day=day, sched_col=col)  # noqa: single cell edit
@@ -2214,6 +2998,9 @@ async def classes_day_handler(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "class_add")
 async def class_add_handler(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
+    # cancel during this flow must return to the admin panel, not the user menu
+    from filetools import _remember_back
+    await _remember_back(state, "admin_main_back")
     await state.set_state(OnlineClassFlow.waiting_title)
     await callback.message.answer(
         "➕ <b>افزودن کلاس آنلاین</b>\n\n"
@@ -2318,7 +3105,8 @@ async def sched_clear_handler(callback: CallbackQuery):
     await callback.answer()
     await models.clear_schedule()
     await models.add_log(callback.from_user.id, callback.from_user.username or "", "clear_schedule", "all")
-    await callback.message.edit_text(
+    await safe_edit_text(
+        callback.message,
         "🗑 کل برنامه هفتگی پاک شد.",
         reply_markup=keyboards.admin_schedule_keyboard(),
     )
@@ -2398,16 +3186,23 @@ async def admin_convert_name(message: Message, state: FSMContext):
         convert.images_to_pdf([Path(p) for p in data["img_paths"]], out)
     except Exception as e:
         await state.clear()
-        await message.answer(f"❌ خطا: {e}", reply_markup=keyboards.admin_main_menu_keyboard())
+        await message.answer(
+            f"❌ خطا: {e}",
+            reply_markup=await keyboards.admin_main_menu_keyboard_for(message.from_user.id),
+        )
         return
     await state.clear()
     try:
-        await message.answer_document(out, caption=f"📄 {name}.pdf ✅")
+        await message.answer_document(
+            FSInputFile(out), caption=f"📄 {name}.pdf ✅")
     finally:
         for p in data["img_paths"]:
             Path(p).unlink(missing_ok=True)
         out.unlink(missing_ok=True)
-    await message.answer("🛠", reply_markup=keyboards.admin_main_menu_keyboard())
+    await message.answer(
+        "🛠",
+        reply_markup=await keyboards.admin_main_menu_keyboard_for(message.from_user.id),
+    )
     await models.add_log(message.from_user.id, message.from_user.username or "", "admin_convert",
                          f"images->pdf ({name})")
 
@@ -2421,7 +3216,7 @@ async def admin_main_back_handler(callback: CallbackQuery):
     await callback.message.edit_text(
         "✅ <b>پنل مدیریت</b>\n\n"
         "به پنل مدیریت خوش آمدید!",
-        reply_markup=keyboards.admin_main_menu_keyboard(),
+        reply_markup=await keyboards.admin_main_menu_keyboard_for(callback.from_user.id),
         parse_mode="HTML",
     )
 
@@ -2455,7 +3250,7 @@ async def note_back_handler(callback: CallbackQuery):
     else:
         await callback.message.edit_text(
             "📚 <b>منوی اصلی</b>",
-            reply_markup=keyboards.main_menu_keyboard(),
+            reply_markup=await keyboards.main_menu_keyboard_for(callback.from_user.id),
             parse_mode="HTML",
         )
 
@@ -2472,9 +3267,9 @@ async def submitter_info_handler(callback: CallbackQuery):
 
     await callback.message.answer(
         f"👤 <b>اطلاعات ثبت‌کننده</b>\n\n"
-        f"📛 نام: {note['submitted_by_name']}\n"
+        f"📛 نام: {escape_html(note['submitted_by_name'] or 'نامشخص')}\n"
         f"🆔 ID: <code>{note['submitted_by']}</code>\n"
-        f"📄 جزوه: {note['title']}",
+        f"📄 جزوه: {escape_html(note['title'])}",
         parse_mode="HTML",
     )
 
@@ -2590,15 +3385,21 @@ async def stats_pdf_handler(callback: CallbackQuery):
     member_users = []
     for m in members:
         member_users.append(m)
-    from models import get_db
-    db = await get_db()
-    usage_rows = await db.execute_fetchall(
-        f"SELECT user_id, uses FROM usage_stats WHERE user_id IN "
-        f"({','.join('?' * len(member_users)) or '0'})",
-        tuple(mu["user_id"] for mu in member_users) or (0,),
-    )
-    await db.close()
-    usage_map = {r["user_id"]: r["uses"] for r in usage_rows}
+    from database import get_db
+    member_ids = [mu["user_id"] for mu in member_users]
+    if member_ids:
+        db = await get_db()
+        try:
+            usage_rows = await db.execute_fetchall(
+                "SELECT user_id, uses FROM usage_stats WHERE user_id IN "
+                f"({','.join('?' * len(member_ids))})",
+                tuple(member_ids),
+            )
+        finally:
+            await db.close()
+        usage_map = {r["user_id"]: r["uses"] for r in usage_rows}
+    else:
+        usage_map = {}
     for m in member_users:
         row = t2.add_row().cells
         row[0].text = f"@{m['username']}" if m["username"] else (m["full_name"] or "-")
@@ -2621,12 +3422,13 @@ async def stats_pdf_handler(callback: CallbackQuery):
     doc.save(docx_path)
     try:
         out_pdf = convert.word_to_pdf(docx_path, out_dir)
-        await callback.message.answer_document(out_pdf, caption="📊 گزارش آماری ربات (PDF)")
+        await callback.message.answer_document(
+            FSInputFile(out_pdf), caption="📊 گزارش آماری ربات (PDF)")
         docx_path.unlink(missing_ok=True)
         out_pdf.unlink(missing_ok=True)
     except RuntimeError as e:
         await callback.message.answer_document(
-            docx_path, caption=f"📊 گزارش آماری (Word)\n{e}")
+            FSInputFile(docx_path), caption=f"📊 گزارش آماری (Word)\n{e}")
         docx_path.unlink(missing_ok=True)
     except Exception as e:
         await callback.answer(f"❌ خطا: {e}", show_alert=True)
@@ -2836,8 +3638,13 @@ async def class_edit_value_handler(message: Message, state: FSMContext):
                     raise ValueError("متن باید بین ۳ تا ۵۰۰ کاراکتر باشد")
                 await models.set_setting("goodnight_text", text, "goodnight message text")
             elif field == "timezone":
+                # ZoneInfo raises ZoneInfoNotFoundError (a KeyError subclass,
+                # NOT a ValueError) for an unknown name
                 from zoneinfo import ZoneInfo
-                ZoneInfo(text)
+                try:
+                    ZoneInfo(text)
+                except Exception:
+                    raise ValueError("منطقه زمانی نامعتبر است (مثال: Asia/Tehran)")
                 await models.set_setting("timezone", text, "project display timezone")
             elif field == "all_reply_text":
                 if not 3 <= len(text) <= 300:
@@ -3038,4 +3845,3 @@ async def tz_custom_handler(callback: CallbackQuery, state: FSMContext):
         "🌍 نام منطقه زمانی IANA را بفرستید (مثلاً Asia/Riyadh):",
         reply_markup=keyboards.cancel_keyboard("tz_menu"),
     )
-

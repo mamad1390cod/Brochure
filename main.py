@@ -14,14 +14,19 @@ Usage:
 """
 
 import asyncio
-import sys
+
+from logger import logger
 
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.types import BotCommand
 from aiogram.client.default import DefaultBotProperties
 
-from config import BOT_TOKEN
+try:
+    from config import BOT_TOKEN
+except Exception:
+    logger.exception("Bot configuration could not be loaded.")
+    raise
 from database import init_database
 from handlers import router as main_router, set_bot_instance
 from notes import router as notes_router
@@ -32,12 +37,20 @@ from filetools import router as filetools_router
 from tasks import router as tasks_router
 from pdfmenu import router as pdfmenu_router
 from groupbot import router as groupbot_router
-from scheduler import start_scheduler
+from scheduler import start_backup_scheduler, start_scheduler, stop_backup_scheduler
 from nudge import start_nudge_scheduler
 from classnotifier import start_class_notifier
-from middleware import UsageMiddleware, StateCleanupMiddleware
+from middleware import (
+    AdminAuthMiddleware,
+    StateCleanupMiddleware,
+    UsageMiddleware,
+)
 from pdfbot import pdf_bot_manager
-from logger import logger
+from callback_ownership import (
+    InlineKeyboardOwnershipMiddleware,
+    InlineKeyboardOwnershipSessionMiddleware,
+)
+from navigation import BackNavigationMiddleware
 
 
 async def on_startup(bot: Bot):
@@ -56,15 +69,18 @@ async def on_startup(bot: Bot):
         await bot.set_my_commands([
             BotCommand(command="start", description="شروع / منوی اصلی"),
             BotCommand(command="help", description="راهنما"),
+            BotCommand(command="cl", description="بازگشت به مرحله قبل"),
         ])
     except Exception as e:
         logger.warning(f"Could not set bot commands: {e}")
 
+    start_backup_scheduler(bot)
     logger.info("Bot is ready!")
 
 
 async def on_shutdown(bot: Bot):
     """Run on bot shutdown."""
+    await stop_backup_scheduler()
     # Note: dp.start_polling() closes the bot session itself;
     # closing it here again would raise. Only log.
     logger.info("Bot-File-School shutting down...")
@@ -78,81 +94,67 @@ async def main():
     """Main entry point."""
     global dp
 
-    # Create bot instance
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-
-    # Set global bot instance for use in other modules
-    set_bot_instance(bot)
-
-    # Create dispatcher
-    dp = Dispatcher()
-
-    # Global safety net: tapping any button outside a half-finished input
-    # flow cancels that flow (state cleared) so stray text is never swallowed.
-    dp.callback_query.outer_middleware(StateCleanupMiddleware())
-
-    # Usage tracking middleware on user-facing routers (NOT the admin router)
-    usage_mw = UsageMiddleware()
-    for r in (notes_router, schedule_router, filetools_router,
-              tasks_router, pdfmenu_router, main_router):
-        r.message.middleware(usage_mw)
-        r.callback_query.middleware(usage_mw)
-
-    # Register routers (order matters - more specific first).
-    # groupbot_router MUST stay last: its catch-all tracker only records
-    # unmatched group messages and must never swallow handled ones.
-    dp.include_router(inline_router)
-    dp.include_router(notes_router)
-    dp.include_router(admin_router)
-    dp.include_router(schedule_router)
-    dp.include_router(filetools_router)
-    dp.include_router(tasks_router)
-    dp.include_router(pdfmenu_router)
-    dp.include_router(main_router)
-    dp.include_router(groupbot_router)
-
-    # Register startup/shutdown hooks
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-
-    # Start the weekly scheduler (Saturday task reset + admin session expiry)
-    start_scheduler()
-
-    # Group nudge scheduler: friendly message if the group is quiet 4+ days
-    start_nudge_scheduler(bot)
-
-    # Online class notifications + goodnight message (timezone aware,
-    # schedules reloaded from the database after every restart)
-    start_class_notifier(bot)
-
-    # Launch the optional standalone PDF bot (bot1cc.py) as a separate process.
-    # If PDF_BOT_PATH is not set/valid this is a no-op and the in-app PDF
-    # tools keep working. A PDF bot crash never stops the main bot.
-    pdf_bot_manager.start()
-
-    # Start polling
-    logger.info("Starting bot polling...")
     try:
+        logger.info("Preparing Bot-File-School.")
+        bot = Bot(
+            token=BOT_TOKEN,
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        )
+        set_bot_instance(bot)
+        dp = Dispatcher()
+
+        bot.session.middleware.register(InlineKeyboardOwnershipSessionMiddleware())
+        dp.message.outer_middleware(InlineKeyboardOwnershipMiddleware())
+        dp.callback_query.outer_middleware(InlineKeyboardOwnershipMiddleware())
+        dp.message.outer_middleware(BackNavigationMiddleware())
+        dp.callback_query.outer_middleware(BackNavigationMiddleware())
+        dp.callback_query.outer_middleware(StateCleanupMiddleware())
+
+        admin_guard = AdminAuthMiddleware(guard_all=False)
+        tasks_router.callback_query.middleware(admin_guard)
+        tasks_router.message.middleware(admin_guard)
+
+        usage_mw = UsageMiddleware()
+        for router in (
+            notes_router, schedule_router, filetools_router,
+            tasks_router, pdfmenu_router, main_router,
+        ):
+            router.message.middleware(usage_mw)
+            router.callback_query.middleware(usage_mw)
+
+        dp.include_router(inline_router)
+        # /start and /help must run before FSM routers; otherwise an in-progress
+        # text-input state can consume the command as ordinary form input.
+        dp.include_router(main_router)
+        dp.include_router(notes_router)
+        dp.include_router(admin_router)
+        dp.include_router(schedule_router)
+        dp.include_router(filetools_router)
+        dp.include_router(tasks_router)
+        dp.include_router(pdfmenu_router)
+        dp.include_router(groupbot_router)
+
+        dp.startup.register(on_startup)
+        dp.shutdown.register(on_shutdown)
+
+        start_scheduler()
+        start_nudge_scheduler(bot)
+        start_class_notifier(bot)
+        pdf_bot_manager.start()
+
+        logger.info("Starting bot polling...")
         await dp.start_polling(bot)
-    except Exception as e:
-        if "database is locked" in str(e).lower():
-            logger.error(
-                "Bot crashed: database is locked!\n"
-                "Possible causes and fixes:\n"
-                "  1. Another instance of the bot is still running - close it.\n"
-                "  2. OneDrive/antivirus is syncing data/school_notes.db - "
-                "pause sync or move the project out of the OneDrive folder.\n"
-                "  3. Delete stale data/school_notes.db-wal and -shm files, "
-                "then start the bot again."
+    except Exception as exc:
+        if "database is locked" in str(exc).lower():
+            logger.exception(
+                "Bot stopped because the database is locked. Check for another "
+                "bot instance, cloud sync, antivirus activity, or stale SQLite "
+                "WAL/SHM files."
             )
         else:
-            logger.error(f"Bot crashed: {e}")
-        sys.exit(1)
+            logger.exception("Bot startup or polling failed.")
+        raise
     finally:
-        # Graceful shutdown of the PDF bot process when the main bot exits
         pdf_bot_manager.stop()
 
 

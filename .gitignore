@@ -4,6 +4,7 @@
 # Database
 data/*.db
 data/*.db-journal
+data/backups/
 
 # Python
 __pycache__/

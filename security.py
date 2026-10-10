@@ -8,15 +8,18 @@ import secrets
 import time
 from typing import Dict, Tuple
 
+PASSWORD_HASH_ITERATIONS = 600_000
+_PASSWORD_HASH_PREFIX = "pbkdf2_sha256"
+
 
 def hash_password(password: str) -> str:
-    """Hash a password using SHA-256 with a random salt.
-    Stored lowercase so verify_password can be case-insensitive."""
+    """Hash a password with PBKDF2-HMAC-SHA256 and a random salt."""
     password = (password or "").strip().casefold()
-    salt = secrets.token_hex(16)
-    salted = f"{salt}{password}"
-    hashed = hashlib.sha256(salted.encode("utf-8")).hexdigest()
-    return f"{salt}${hashed}"
+    salt = secrets.token_bytes(16)
+    hashed = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, PASSWORD_HASH_ITERATIONS
+    ).hex()
+    return f"{_PASSWORD_HASH_PREFIX}${PASSWORD_HASH_ITERATIONS}${salt.hex()}${hashed}"
 
 
 def verify_password(password: str, stored_hash: str) -> bool:
@@ -27,13 +30,32 @@ def verify_password(password: str, stored_hash: str) -> bool:
     input; legacy hashes of already-lowercase passwords still match.
     Only admin login uses this - usernames/names/files are unaffected.
     """
+    password = (password or "").strip().casefold()
+    if stored_hash.startswith(f"{_PASSWORD_HASH_PREFIX}$"):
+        try:
+            _, raw_iterations, raw_salt, expected_hash = stored_hash.split("$", 3)
+            iterations = int(raw_iterations)
+            salt = bytes.fromhex(raw_salt)
+            if not 1 <= iterations <= 1_000_000:
+                return False
+        except (ValueError, TypeError):
+            return False
+        actual_hash = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt, iterations
+        ).hex()
+        return secrets.compare_digest(actual_hash, expected_hash)
+
+    # Accept existing salted SHA-256 hashes; successful logins can upgrade them.
     if "$" not in stored_hash:
         return False
-    password = (password or "").strip().casefold()
     salt, expected_hash = stored_hash.split("$", 1)
-    salted = f"{salt}{password}"
-    actual_hash = hashlib.sha256(salted.encode("utf-8")).hexdigest()
+    actual_hash = hashlib.sha256(f"{salt}{password}".encode("utf-8")).hexdigest()
     return secrets.compare_digest(actual_hash, expected_hash)
+
+
+def password_hash_needs_upgrade(stored_hash: str) -> bool:
+    """Return whether a stored password uses the legacy fast hash format."""
+    return not stored_hash.startswith(f"{_PASSWORD_HASH_PREFIX}$")
 
 
 class LoginRateLimiter:

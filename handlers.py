@@ -3,6 +3,8 @@ Main handlers for Bot-File-School.
 Handles /start, /help, and general user interactions.
 """
 
+from pathlib import Path
+
 from aiogram import Bot, Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
@@ -17,6 +19,7 @@ from config import ALLOWED_GROUP_ID, MAIN_ADMIN_ID
 from permissions import is_admin
 from utils import escape_html
 from logger import logger
+from navigation import pop_previous_step, restore_previous_screen
 
 
 class UserChapterSearch(StatesGroup):
@@ -36,11 +39,40 @@ def set_bot_instance(bot_instance: Bot):
 
 # ─── /start Command ──────────────────────────────────────────────────────────
 
+@router.message(Command("cl"))
+async def back_command_handler(message: Message, state: FSMContext):
+    """Return to the previous recorded screen and restore its FSM data."""
+    step = pop_previous_step(message.chat.id, message.from_user.id)
+    if step is None:
+        await message.answer("↩️ مرحله قبلی برای بازگشت وجود ندارد.")
+        return
+
+    current_data = await state.get_data()
+    if step.state and step.state.startswith("FileToolsFlow:"):
+        paths = set(current_data.get("img_paths", []))
+        restored_paths = set(step.data.get("img_paths", []))
+        step.data["img_paths"] = [
+            path for path in step.data.get("img_paths", [])
+            if path in paths and Path(path).exists()
+        ]
+        for path in paths - restored_paths:
+            Path(path).unlink(missing_ok=True)
+
+    await state.set_data(step.data)
+    await state.set_state(step.state)
+    if step.screen is None or not await restore_previous_screen(message, step.screen):
+        await message.answer("↩️ به مرحله قبلی برگشتید؛ اطلاعات همان مرحله را دوباره ارسال کنید.")
+
+
 @router.message(Command("start", "help", "راهنما"))
 async def start_handler(message: Message, state: FSMContext):
-    """Handle /start command - different behavior for admins vs regular users."""
+    """Show the user menu to everyone and the admin entry to valid admins."""
     # /start always cancels any half-finished input flow
     if state:
+        current_state = await state.get_state()
+        if current_state and current_state.startswith("FileToolsFlow:"):
+            from filetools import cleanup_filetools_state
+            await cleanup_filetools_state(state)
         await state.clear()
     user = message.from_user
 
@@ -52,44 +84,34 @@ async def start_handler(message: Message, state: FSMContext):
     ):
         return
 
-    # Save/update user in database
-    await models.upsert_user(user.id, user.username or "", user.full_name or "")
-
-    # Check if user is an admin
-    if await is_admin(user.id):
-        import security
-        if security.admin_sessions.is_authenticated(user.id):
-            # Session valid - skip password, straight to the panel
-            await message.answer(
-                f"👋 سلام <b>{user.full_name}</b>!\n\n"
-                "✅ نشست شما همچنان فعال است؛ پنل مدیریت:",
-                reply_markup=keyboards.admin_main_menu_keyboard(),
-                parse_mode="HTML",
-            )
-        else:
-            # Admin flow - show login option
-            await message.answer(
-                f"👋 سلام <b>{user.full_name}</b>!\n\n"
-                "شما به عنوان ادمین شناسایی شدید.\n"
-                "برای ورود به پنل مدیریت دکمه زیر را بزنید:",
-                reply_markup=keyboards.admin_login_keyboard(),
-                parse_mode="HTML",
-            )
-    else:
-        # Regular user flow - show main menu
+    try:
+        await models.upsert_user(user.id, user.username or "", user.full_name or "")
+        has_admin_access = await is_admin(user.id)
         await message.answer(
-            f"👋 سلام <b>{user.full_name}</b>!\n\n"
+            f"👋 سلام <b>{escape_html(user.full_name)}</b>!\n\n"
             "به ربات مدیریت جزوه‌های مدرسه خوش آمدید! 📚\n\n"
             "با این ربات می‌توانید:\n"
             "• جزوه‌ها را بر اساس رشته، درس و فصل مشاهده کنید\n"
             "• جزوه‌ها را جستجو کنید\n"
             "• جزوه جدید ثبت کنید\n\n"
+            "برای بازگشت به مرحله قبلی در هر زمان /cl را ارسال کنید.\n\n"
             "از منوی زیر استفاده کنید:",
-            reply_markup=keyboards.main_menu_keyboard(),
+            reply_markup=keyboards.main_menu_keyboard(
+                has_admin_access=has_admin_access
+            ),
             parse_mode="HTML",
         )
+    except Exception:
+        logger.exception("Could not process /start for Telegram user %s", user.id)
+        try:
+            await message.answer(
+                "❌ شروع ربات موقتاً با خطا روبه‌رو شد. لطفاً کمی بعد دوباره /start را بزنید."
+            )
+        except Exception:
+            logger.exception("Could not send /start failure notice to user %s", user.id)
+        return
 
-    logger.info(f"User {user.id} ({user.username}) started the bot")
+    logger.info("User %s (@%s) started the bot", user.id, user.username or "")
 
 
 # ─── Persian Command: جزوه ──────────────────────────────────────────────────
@@ -103,7 +125,7 @@ async def jozve_command(message: Message, state: FSMContext):
     if not fields:
         await message.answer(
             "❌ هیچ رشته‌ای ثبت نشده است. لطفاً بعداً تلاش کنید.",
-            reply_markup=keyboards.main_menu_keyboard(),
+            reply_markup=await keyboards.main_menu_keyboard_for(message.from_user.id),
         )
         return
 
@@ -155,7 +177,7 @@ async def menu_fields_handler(callback: CallbackQuery):
     if not fields:
         await callback.message.edit_text(
             "📚 هیچ رشته‌ای ثبت نشده است.",
-            reply_markup=keyboards.main_menu_keyboard(),
+            reply_markup=await keyboards.main_menu_keyboard_for(callback.from_user.id),
             parse_mode="HTML",
         )
         return
@@ -472,7 +494,7 @@ async def menu_search_handler(callback: CallbackQuery):
         "در هر چتی نام ربات را تایپ کنید و کلمه کلیدی را بنویسید:\n\n"
         f"<code>@{bot_username} ریاضی</code>\n\n"
         "جستجو در عنوان، توضیحات، نام رشته، درس و فصل انجام می‌شود.",
-        reply_markup=keyboards.main_menu_keyboard(),
+        reply_markup=await keyboards.main_menu_keyboard_for(callback.from_user.id),
         parse_mode="HTML",
     )
 
@@ -488,6 +510,6 @@ async def menu_main_handler(callback: CallbackQuery):
     await callback.message.edit_text(
         "📚 <b>منوی اصلی</b>\n\n"
         "گزینه‌ای را انتخاب کنید:",
-        reply_markup=keyboards.main_menu_keyboard(),
+        reply_markup=await keyboards.main_menu_keyboard_for(callback.from_user.id),
         parse_mode="HTML",
     )

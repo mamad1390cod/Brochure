@@ -5,6 +5,8 @@ Handles SQLite connection, schema creation, and query execution.
 
 import asyncio
 import sqlite3
+from contextlib import asynccontextmanager
+
 import aiosqlite
 from pathlib import Path
 from config import DATABASE_PATH
@@ -176,6 +178,19 @@ CREATE TABLE IF NOT EXISTS task_done (
     UNIQUE(user_id, task_key, week_key)
 );
 
+-- Ownership and allowed actions for every bot message with inline callbacks.
+-- Ownership is immutable after insertion; edits only update the active actions.
+CREATE TABLE IF NOT EXISTS inline_keyboard_ownership (
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    owner_user_id INTEGER NOT NULL,
+    operation_types TEXT NOT NULL,
+    callback_data TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chat_id, message_id)
+);
+
 -- Online classes (کلاس‌های آنلاین) - admin-defined, per day of week
 -- start_hour/start_minute/end_hour are in Asia/Tehran time (class source
 -- timetable). They are converted to the project timezone for display/sending.
@@ -192,6 +207,22 @@ CREATE TABLE IF NOT EXISTS online_classes (
     is_active INTEGER DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- School timetable classes, independent by track and weekday.
+CREATE TABLE IF NOT EXISTS weekly_classes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    track_key TEXT NOT NULL CHECK (track_key IN ('math', 'experimental', 'humanities')),
+    day_index INTEGER NOT NULL CHECK (day_index BETWEEN 0 AND 6),
+    class_name TEXT NOT NULL,
+    start_time TEXT NOT NULL,
+    end_time TEXT NOT NULL,
+    submission_key TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_weekly_classes_track_day_time
+    ON weekly_classes(track_key, day_index, start_time, id);
 
 -- Group activity tracking (for the "bot unused for 4 days" nudge feature)
 CREATE TABLE IF NOT EXISTS group_activity (
@@ -261,6 +292,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     title TEXT NOT NULL,
     details TEXT DEFAULT '',
     created_by INTEGER,
+    field_id INTEGER,
+    subject_id INTEGER,
+    day_index INTEGER,
+    due_at TEXT,
+    file_id TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     is_active INTEGER DEFAULT 1,
     FOREIGN KEY (category_id) REFERENCES task_categories(id) ON DELETE CASCADE
@@ -280,6 +316,8 @@ CREATE INDEX IF NOT EXISTS idx_task_status_user ON task_status(user_id, week_key
 CREATE INDEX IF NOT EXISTS idx_tasks_category ON tasks(category_id);
 CREATE INDEX IF NOT EXISTS idx_task_done_user ON task_done(user_id, week_key);
 CREATE INDEX IF NOT EXISTS idx_online_classes_day ON online_classes(day_index);
+CREATE INDEX IF NOT EXISTS idx_inline_keyboard_owner
+    ON inline_keyboard_ownership(owner_user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_group_members_chat ON group_members(chat_id);
 CREATE INDEX IF NOT EXISTS idx_usage_stats_uses ON usage_stats(uses DESC);
 """
@@ -291,6 +329,11 @@ COLUMN_MIGRATIONS = [
     ("online_classes", "start_minute", "INTEGER DEFAULT 0"),
     ("online_classes", "end_hour", "INTEGER"),
     ("online_classes", "notify_enabled", "INTEGER DEFAULT 1"),
+    ("tasks", "field_id", "INTEGER"),
+    ("tasks", "subject_id", "INTEGER"),
+    ("tasks", "day_index", "INTEGER"),
+    ("tasks", "due_at", "TEXT"),
+    ("tasks", "file_id", "TEXT"),
 ]
 
 
@@ -339,6 +382,10 @@ async def init_database():
             try:
                 await db.executescript(SCHEMA_SQL)
                 await _migrate_columns(db)
+                await db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_active_deadline "
+                    "ON tasks(is_active, due_at)"
+                )
                 await db.commit()
                 break
             except aiosqlite.OperationalError as e:
@@ -362,6 +409,10 @@ async def init_database():
 async def get_db() -> aiosqlite.Connection:
     """Get a database connection with proper settings.
 
+    Prefer `db_session()` - it guarantees the connection is rolled back and
+    closed even when a query raises (see the note there). Use this raw form
+    only when the connection is handed to another component.
+
     Note: journal_mode is intentionally NOT set here - WAL persists in the
     database file and re-running the pragma on every connection requires
     an exclusive lock, which causes 'database is locked' errors.
@@ -371,6 +422,68 @@ async def get_db() -> aiosqlite.Connection:
     await db.execute("PRAGMA busy_timeout=30000")
     await db.execute("PRAGMA foreign_keys=ON")
     return db
+
+
+@asynccontextmanager
+async def db_session():
+    """Async context manager around a database connection (read or write).
+
+    A connection that is left open after a failed statement keeps its write
+    transaction (and therefore the SQLite write lock) alive until it is
+    garbage collected. Every other writer then blocks for the full
+    busy_timeout and finally fails with 'database is locked'. Using this
+    context manager makes that impossible: the transaction is rolled back
+    and the connection closed on every exit path, including exceptions.
+
+    Write statements should use `db_write_session()` instead - see the note
+    about transaction upgrades there.
+    """
+    db = await get_db()
+    try:
+        yield db
+    except BaseException:
+        try:
+            await db.rollback()
+        except Exception:  # pragma: no cover - best effort cleanup
+            pass
+        raise
+    finally:
+        try:
+            await db.close()
+        except Exception:  # pragma: no cover - best effort cleanup
+            pass
+
+
+# One write lock per event loop. SQLite allows a single writer at a time; the
+# lock keeps that serialisation inside the process instead of letting N
+# connections fight for it in the C library.
+_write_locks: dict[int, asyncio.Lock] = {}
+
+
+def _write_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _write_locks.get(id(loop))
+    if lock is None:
+        lock = asyncio.Lock()
+        _write_locks[id(loop)] = lock
+    return lock
+
+
+@asynccontextmanager
+async def db_write_session():
+    """Like db_session(), but serialised against other writers.
+
+    Every connection opens SQLite in 'deferred' mode: the transaction starts
+    with the first statement, and a transaction that has already READ and then
+    wants to WRITE must wait for the write lock. That upgrade cannot use the
+    busy handler, so under concurrency SQLite returns SQLITE_BUSY immediately -
+    'database is locked' regardless of busy_timeout. Taking this lock first
+    means at most one write transaction exists at any moment, so the upgrade
+    can never conflict. Reads are unaffected and stay concurrent (WAL).
+    """
+    async with _write_lock():
+        async with db_session() as db:
+            yield db
 
 
 # ─── Synchronous helpers for inline queries ──────────────────────────────────

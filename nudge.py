@@ -107,7 +107,7 @@ async def nudge_loop(bot: Bot) -> None:
                     chat_id = group["chat_id"]
                     msg, idx = _pick_message(_last_nudge_index.get(chat_id))
                     _last_nudge_index[chat_id] = idx
-                    text = msg.format(bot=f"@{bot_username}")
+                    text = msg.format(bot=bot_username)
                     try:
                         await bot.send_message(chat_id, text)
                         await models.mark_group_nudged(chat_id)

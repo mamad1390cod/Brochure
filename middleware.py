@@ -13,7 +13,7 @@ from aiogram.types import CallbackQuery, Message
 from typing import Any, Awaitable, Callable, Dict
 
 import security
-from permissions import check_permission, is_owner, CALLBACK_PERMISSIONS
+from permissions import check_permission, is_admin, CALLBACK_PERMISSIONS
 from logger import logger
 
 # Callback-data prefixes that are always allowed without authentication
@@ -43,11 +43,25 @@ STATE_PERMISSIONS = {
     "NoteLimitFlow": "manage_users",
     "ClassEditFlow": "manage_classes",
     "ChapterSearchFlow": "manage_fields",
+    "WeeklyClassFlow": "manage_schedule",
 }
 
 
 class AdminAuthMiddleware(BaseMiddleware):
-    """Require an authenticated admin session and granular permissions."""
+    """Require an authenticated admin session and granular permissions.
+
+    guard_all=True  - every callback on the router belongs to the admin panel
+                      (the admin router).
+    guard_all=False - MIXED router: only callbacks/state flows that are listed
+                      in CALLBACK_PERMISSIONS / STATE_PERMISSIONS are guarded,
+                      everything else keeps working for regular users. Use this
+                      on routers that serve both users and admins (e.g. the
+                      tasks router), otherwise admin handlers on that router
+                      would be reachable without any admin session.
+    """
+
+    def __init__(self, guard_all: bool = True) -> None:
+        self.guard_all = guard_all
 
     async def __call__(
         self,
@@ -61,6 +75,9 @@ class AdminAuthMiddleware(BaseMiddleware):
 
         user_id = user.id
         authenticated = security.admin_sessions.is_authenticated(user_id)
+        if authenticated and not await is_admin(user_id):
+            security.admin_sessions.logout(user_id)
+            authenticated = False
 
         if isinstance(event, CallbackQuery):
             callback_base = (event.data or "").split(":")[0]
@@ -68,12 +85,18 @@ class AdminAuthMiddleware(BaseMiddleware):
             if callback_base in EXEMPT_CALLBACKS:
                 return await handler(event, data)
 
+            if not self.guard_all and callback_base not in CALLBACK_PERMISSIONS:
+                return await handler(event, data)  # not an admin feature
+
             if authenticated:
                 # Sliding refresh - active admins keep their session alive
                 security.admin_sessions.refresh(user_id)
 
             if not authenticated:
-                await event.answer("🔒 ابتدا وارد پنل مدیریت شوید.", show_alert=True)
+                await event.answer(
+                    "🔒 ابتدا وارد پنل مدیریت شوید؛ این بخش فقط برای ادمین معتبر است.",
+                    show_alert=True,
+                )
                 return None
 
             permission = CALLBACK_PERMISSIONS.get(callback_base)
@@ -98,11 +121,15 @@ class AdminAuthMiddleware(BaseMiddleware):
             if state_str and state_str.startswith("AdminLogin:"):
                 return await handler(event, data)
 
+            flow = state_str.split(":")[0] if state_str else None
+
+            if not self.guard_all and (flow is None or flow not in STATE_PERMISSIONS):
+                return await handler(event, data)  # not an admin flow
+
             if not authenticated:
                 return None  # Silently ignore stray messages
 
             if state_str:
-                flow = state_str.split(":")[0]
                 permission = STATE_PERMISSIONS.get(flow)
                 if permission and not await check_permission(user_id, permission):
                     await event.answer("❌ شما دسترسی لازم برای این عملیات را ندارید.")
@@ -124,8 +151,14 @@ KEEP_STATE_CALLBACKS = {
     # submit-note flow (user picks field/subject/chapter via callbacks)
     "submit_note_start", "submit_field", "submit_subject", "submit_chapter",
     "submit_no_chapter", "submit_back_subject", "submit_cancel",
-    # file tools (images are collected via messages, done/cancel via callbacks)
-    "tool_images_done", "tools_cancel",
+    # file tools are collected via messages and cancelled via callbacks
+    "tools_cancel",
+    # Homework creation requires multiple inline selections between inputs.
+    "tasks_field", "tasks_subject", "tasks_day",
+    # Weekly timetable creation/edit selection and confirmation.
+    "weekly_add_track", "weekly_add_day", "weekly_edit_choose_track",
+    "weekly_edit_choose_day", "weekly_add_confirm", "weekly_edit_confirm",
+    "weekly_correct",
 }
 
 
@@ -136,9 +169,13 @@ class StateCleanupMiddleware(BaseMiddleware):
 
     async def __call__(self, handler, event, data):
         state = data.get("state")
-        if state is not None and await state.get_state():
+        state_str = await state.get_state() if state is not None else None
+        if state_str:
             callback_base = (getattr(event, "data", "") or "").split(":")[0]
             if callback_base not in KEEP_STATE_CALLBACKS:
+                if state_str.startswith("FileToolsFlow:"):
+                    from filetools import cleanup_filetools_state
+                    await cleanup_filetools_state(state)
                 await state.clear()
         return await handler(event, data)
 

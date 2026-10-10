@@ -40,7 +40,7 @@ async def submit_note_start_handler(callback: CallbackQuery, state: FSMContext):
     if not fields:
         await callback.message.edit_text(
             "❌ هیچ رشته‌ای ثبت نشده است. لطفاً بعداً تلاش کنید.",
-            reply_markup=keyboards.main_menu_keyboard(),
+            reply_markup=await keyboards.main_menu_keyboard_for(callback.from_user.id),
         )
         return
     await state.set_state(SubmitNoteFlow.selecting_field)
@@ -258,7 +258,7 @@ async def submit_receive_file(message: Message, state: FSMContext):
         await state.clear()
         await message.answer(
             "❌ خطایی در جریان ثبت جزوه رخ داد. لطفاً دوباره از منوی اصلی شروع کنید:",
-            reply_markup=keyboards.main_menu_keyboard(),
+            reply_markup=await keyboards.main_menu_keyboard_for(message.from_user.id),
         )
         return
 
@@ -383,7 +383,7 @@ async def submit_receive_file(message: Message, state: FSMContext):
             f"📚 {data.get('field_name', '')} → 📖 {data.get('subject_name', '')}\n"
             f"📕 {data.get('chapter_name', 'بدون فصل')}\n\n"
             f"با توجه به دسترسی ویژه شما، جزوه بدون نیاز به تأیید ثبت شد.",
-            reply_markup=keyboards.main_menu_keyboard(),
+            reply_markup=await keyboards.main_menu_keyboard_for(message.from_user.id),
             parse_mode="HTML",
         )
 
@@ -418,7 +418,7 @@ async def submit_receive_file(message: Message, state: FSMContext):
             f"📕 {data.get('chapter_name', 'بدون فصل')}\n\n"
             f"⏳ جزوه شما به ادمین ارسال شد و پس از تأیید قابل مشاهده خواهد بود."
             f"{quota_note}",
-            reply_markup=keyboards.main_menu_keyboard(),
+            reply_markup=await keyboards.main_menu_keyboard_for(message.from_user.id),
             parse_mode="HTML",
         )
 
@@ -463,7 +463,7 @@ async def submit_cancel_handler(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text(
         "❌ ثبت جزوه لغو شد.",
-        reply_markup=keyboards.main_menu_keyboard(),
+        reply_markup=await keyboards.main_menu_keyboard_for(callback.from_user.id),
     )
 
 

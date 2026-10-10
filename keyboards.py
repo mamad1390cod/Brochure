@@ -20,8 +20,8 @@ def cancel_keyboard(callback_data: str = "generic_cancel") -> InlineKeyboardMark
 
 # ─── Main Menus ──────────────────────────────────────────────────────────────
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Main menu for regular users in group chat."""
+def main_menu_keyboard(has_admin_access: bool = False) -> InlineKeyboardMarkup:
+    """Build the user menu and optionally expose the admin-panel entry."""
     kb = InlineKeyboardBuilder()
     kb.row(
         InlineKeyboardButton(text="📚 مشاهده جزوه‌ها", callback_data="menu_fields"),
@@ -37,7 +37,18 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="📄 ساخت PDF", callback_data="menu_make_pdf"),
         InlineKeyboardButton(text="📚 تکالیف", callback_data="menu_tasks"),
     )
+    if has_admin_access:
+        kb.row(
+            InlineKeyboardButton(text="⚙️ پنل مدیریت", callback_data="admin_login"),
+        )
     return kb.as_markup()
+
+
+async def main_menu_keyboard_for(user_id: int) -> InlineKeyboardMarkup:
+    """Show the admin entry only to an active, database-backed admin or Owner."""
+    from permissions import is_admin
+
+    return main_menu_keyboard(await is_admin(user_id))
 
 
 def auto_columns_keyboard(items: list, back: tuple | None = None) -> InlineKeyboardMarkup:
@@ -144,6 +155,18 @@ def admin_login_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(
         InlineKeyboardButton(text="🔐 ورود به پنل مدیریت", callback_data="admin_login"),
+    )
+    return kb.as_markup()
+
+
+def image_conversion_mode_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="🖼️ یک تصویر", callback_data="tool_images_single"),
+        InlineKeyboardButton(text="🖼️🖼️ چند تصویر", callback_data="tool_images_multi"),
+    )
+    kb.row(
+        InlineKeyboardButton(text="❌ لغو عملیات", callback_data="tools_cancel"),
     )
     return kb.as_markup()
 
@@ -404,6 +427,56 @@ def note_approval_keyboard(note_id: int) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+def pending_notes_keyboard(notes: list, page: int, has_more: bool) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for note in notes:
+        label = note["title"][:35]
+        submitter = note["submitted_by_name"] or "بدون نام"
+        kb.row(
+            InlineKeyboardButton(
+                text=f"📄 {label} · {submitter[:16]}",
+                callback_data=f"pending_note:{note['id']}:{page}",
+            )
+        )
+    if page > 0 or has_more:
+        controls = []
+        if page > 0:
+            controls.append(
+                InlineKeyboardButton(
+                    text="⬅️ قبلی", callback_data=f"admin_pending_page:{page - 1}"
+                )
+            )
+        if has_more:
+            controls.append(
+                InlineKeyboardButton(
+                    text="بعدی ➡️", callback_data=f"admin_pending_page:{page + 1}"
+                )
+            )
+        kb.row(*controls)
+    kb.row(InlineKeyboardButton(text="🔙 پنل مدیریت", callback_data="admin_main_back"))
+    return kb.as_markup()
+
+
+def pending_note_detail_keyboard(note_id: int, page: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="✅ تأیید", callback_data=f"approve:{note_id}"),
+        InlineKeyboardButton(text="❌ رد", callback_data=f"reject:{note_id}"),
+    )
+    kb.row(
+        InlineKeyboardButton(text="📎 مشاهده فایل", callback_data=f"note_download:{note_id}"),
+        InlineKeyboardButton(
+            text="👤 اطلاعات ثبت‌کننده", callback_data=f"submitter_info:{note_id}"
+        ),
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text="🔙 فهرست درخواست‌ها", callback_data=f"admin_pending_page:{page}"
+        )
+    )
+    return kb.as_markup()
+
+
 # ─── Admin Management ────────────────────────────────────────────────────────
 
 def admins_list_keyboard(admins: list) -> InlineKeyboardMarkup:
@@ -533,7 +606,7 @@ def file_tools_keyboard(back_to: str = "menu_tools") -> InlineKeyboardMarkup:
     the exact panel they came from (main menu, admin panel, PDF menu)."""
     kb = InlineKeyboardBuilder()
     kb.row(
-        InlineKeyboardButton(text="🖼 تصاویر → PDF", callback_data="tool_images_pdf"),
+        InlineKeyboardButton(text="🖼PDF تصویر به ", callback_data="tool_images_pdf"),
         InlineKeyboardButton(text="📄 Word → PDF", callback_data="tool_word_pdf"),
     )
     kb.row(
@@ -660,22 +733,19 @@ def sched_periods_keyboard(field_id: int, cleared: bool = False) -> InlineKeyboa
 def admin_schedule_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(
-        InlineKeyboardButton(text="👁 مشاهده برنامه هفتگی", callback_data="admin_schedule_view"),
+        InlineKeyboardButton(text="➕ افزودن کلاس به برنامه هفتگی", callback_data="weekly_add"),
     )
     kb.row(
-        InlineKeyboardButton(text="✏️ ویرایش برنامه کلاس", callback_data="sched_edit_start"),
+        InlineKeyboardButton(text="📋 مشاهده برنامه‌های ثبت‌شده", callback_data="weekly_view"),
     )
     kb.row(
-        InlineKeyboardButton(text="🟢 مدیریت کلاس‌های آنلاین", callback_data="admin_classes"),
+        InlineKeyboardButton(text="✏️ ویرایش کلاس", callback_data="weekly_edit"),
     )
     kb.row(
-        InlineKeyboardButton(text="🗑 پاک کردن کل برنامه", callback_data="sched_clear"),
+        InlineKeyboardButton(text="🗑 حذف کلاس", callback_data="weekly_delete"),
     )
     kb.row(
-        InlineKeyboardButton(text="📅 پاک کردن تکالیف انجام‌شده این هفته", callback_data="sched_reset_tasks"),
-    )
-    kb.row(
-        InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin_main_back"),
+        InlineKeyboardButton(text="🔙 بازگشت به پنل مدیریت", callback_data="admin_main_back"),
     )
     return kb.as_markup()
 
@@ -736,6 +806,131 @@ def task_detail_keyboard(task_id: int) -> InlineKeyboardMarkup:
     )
     kb.row(
         InlineKeyboardButton(text="🔙 بازگشت", callback_data="tasks_admin_list"),
+    )
+    return kb.as_markup()
+
+
+def task_fields_keyboard(fields: list) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for field in fields:
+        kb.row(
+            InlineKeyboardButton(
+                text=f"📚 {field['name']}", callback_data=f"tasks_field:{field['id']}"
+            )
+        )
+    kb.row(InlineKeyboardButton(text="❌ لغو عملیات", callback_data="tasks_flow_cancel"))
+    return kb.as_markup()
+
+
+def task_subjects_keyboard(subjects: list) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for subject in subjects:
+        kb.row(
+            InlineKeyboardButton(
+                text=f"📖 {subject['name']}",
+                callback_data=f"tasks_subject:{subject['id']}",
+            )
+        )
+    kb.row(
+        InlineKeyboardButton(text="🔙 بازگشت", callback_data="tasks_task_add"),
+        InlineKeyboardButton(text="❌ لغو", callback_data="tasks_flow_cancel"),
+    )
+    return kb.as_markup()
+
+
+def task_days_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    days = ["شنبه", "یکشنبه", "دوشنبه", "سه‌شنبه", "چهارشنبه", "پنجشنبه", "جمعه"]
+    for index, day in enumerate(days):
+        kb.row(
+            InlineKeyboardButton(text=f"📅 {day}", callback_data=f"tasks_day:{index}")
+        )
+    kb.row(InlineKeyboardButton(text="❌ لغو عملیات", callback_data="tasks_flow_cancel"))
+    return kb.as_markup()
+
+
+def task_user_list_keyboard(tasks: list, page: int, has_more: bool) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for task in tasks:
+        title = task["title"][:45]
+        kb.row(
+            InlineKeyboardButton(
+                text=f"📝 {title}",
+                callback_data=f"task_view:{task['id']}:{page}",
+            )
+        )
+    if page > 0 or has_more:
+        controls = []
+        if page > 0:
+            controls.append(
+                InlineKeyboardButton(
+                    text="⬅️ قبلی", callback_data=f"menu_tasks_page:{page - 1}"
+                )
+            )
+        if has_more:
+            controls.append(
+                InlineKeyboardButton(
+                    text="بعدی ➡️", callback_data=f"menu_tasks_page:{page + 1}"
+                )
+            )
+        kb.row(*controls)
+    kb.row(InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="menu_main"))
+    return kb.as_markup()
+
+
+def task_user_detail_keyboard(task_id: int, page: int, has_file: bool) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    if has_file:
+        kb.row(
+            InlineKeyboardButton(
+                text="🖼 مشاهده تصویر تکلیف", callback_data=f"task_photo:{task_id}"
+            )
+        )
+    kb.row(
+        InlineKeyboardButton(
+            text="🔙 فهرست تکالیف", callback_data=f"menu_tasks_page:{page}"
+        )
+    )
+    return kb.as_markup()
+
+
+def task_admin_list_keyboard(tasks: list, page: int, has_more: bool) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for task in tasks:
+        kb.row(
+            InlineKeyboardButton(
+                text=f"📝 {task['title'][:45]}",
+                callback_data=f"tasks_admin_view:{task['id']}:{page}",
+            )
+        )
+    if page > 0 or has_more:
+        controls = []
+        if page > 0:
+            controls.append(
+                InlineKeyboardButton(
+                    text="⬅️ قبلی", callback_data=f"tasks_admin_page:{page - 1}"
+                )
+            )
+        if has_more:
+            controls.append(
+                InlineKeyboardButton(
+                    text="بعدی ➡️", callback_data=f"tasks_admin_page:{page + 1}"
+                )
+            )
+        kb.row(*controls)
+    kb.row(InlineKeyboardButton(text="🔙 مدیریت تکالیف", callback_data="admin_tasks"))
+    return kb.as_markup()
+
+
+def task_admin_detail_keyboard(task_id: int, page: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="🗑 حذف تکلیف", callback_data=f"tasks_task_delete:{task_id}")
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text="🔙 فهرست تکالیف", callback_data=f"tasks_admin_page:{page}"
+        )
     )
     return kb.as_markup()
 

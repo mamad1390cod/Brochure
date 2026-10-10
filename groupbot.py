@@ -70,11 +70,17 @@ async def all_command_handler(message: Message, bot: Bot, state: FSMContext):
             "🤷 هنوز کسی رو ثبت نکردم! یکی دو تا پیام تو گروه بفرستید تا بشناسمتون.")
         return
 
+    claimed, remaining = await models.claim_all_cooldown(
+        message.chat.id, ALL_COOLDOWN_SECONDS)
+    if not claimed:
+        await message.reply(
+            f"⏳ بابا آروم! ⏰ {remaining} ثانیه دیگه دوباره می‌تونی همه رو صدا کنی 😅")
+        return
+
     mentions = " ".join(_mention_for(m) for m in members[:100])
     reply = await models.get_setting("all_reply_text", DEFAULT_ALL_REPLY)
     reply = reply.replace("{count}", str(len(members)))
 
-    await models.all_cooldown_set(message.chat.id)
     await message.answer(f"{mentions}\n\n{escape_html(reply)}")
     logger.info(f"/all used in chat {message.chat.id} "
                 f"({len(members)} members) by {message.from_user.id}")

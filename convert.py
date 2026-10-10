@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import shutil
 from pathlib import Path
-from typing import List
+from typing import Sequence
 
 from logger import logger
 
@@ -24,29 +24,47 @@ def _ensure_temp() -> Path:
     return TEMP_DIR
 
 
-def images_to_pdf(image_paths: List[Path], out_path: Path) -> Path:
-    """Convert a list of image files into one PDF using Pillow."""
-    from PIL import Image
+def images_to_pdf(image_paths: Sequence[Path], out_path: Path) -> Path:
+    """Convert ordered images into one-page-per-image PDF pages."""
+    from PIL import Image, ImageOps, UnidentifiedImageError
+
+    if not image_paths:
+        raise ValueError("No images received")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    imgs: List[Image.Image] = []
+    pdf_images: list[Image.Image] = []
     try:
-        for p in image_paths:
-            img = Image.open(p)
-            if img.mode in ("RGBA", "P"):
-                img = img.convert("RGB")
-            imgs.append(img)
-        if not imgs:
-            raise ValueError("No images received")
-        first, rest = imgs[0], imgs[1:]
-        first.save(out_path, "PDF", save_all=True, append_images=rest)
+        for path in image_paths:
+            with Image.open(path) as source:
+                source.seek(0)
+                oriented = ImageOps.exif_transpose(source)
+                has_alpha = (
+                    oriented.mode in ("RGBA", "LA")
+                    or (oriented.mode == "P" and "transparency" in oriented.info)
+                )
+                if has_alpha:
+                    rgba = oriented.convert("RGBA")
+                    background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+                    background.alpha_composite(rgba)
+                    converted = background.convert("RGB")
+                    rgba.close()
+                    background.close()
+                else:
+                    converted = oriented.convert("RGB")
+                pdf_images.append(converted)
+
+        first, *rest = pdf_images
+        first.save(out_path, "PDF", save_all=True, append_images=rest, resolution=150)
+        return out_path
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        out_path.unlink(missing_ok=True)
+        raise ValueError(f"Invalid or unsupported image: {exc}") from exc
+    except Exception:
+        out_path.unlink(missing_ok=True)
+        raise
     finally:
-        for img in imgs:
-            try:
-                img.close()
-            except Exception:
-                pass
-    return out_path
+        for image in pdf_images:
+            image.close()
 
 
 def _libreoffice_bin() -> str | None:

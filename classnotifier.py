@@ -84,11 +84,11 @@ def _group_target() -> int | None:
     return ALLOWED_GROUP_ID
 
 
-async def send_class_alert(bot: Bot, cls, local_tz: ZoneInfo) -> None:
+async def send_class_alert(bot: Bot, cls, local_tz: ZoneInfo) -> bool:
     chat_id = _group_target()
     if chat_id is None:
         logger.info("Class alert skipped - no ALLOWED_GROUP_ID configured")
-        return
+        return False
     template = await models.get_setting("class_notify_text", DEFAULT_CLASS_TEXT)
     text = template.format(
         subject=cls["title"],
@@ -101,8 +101,10 @@ async def send_class_alert(bot: Bot, cls, local_tz: ZoneInfo) -> None:
     try:
         await bot.send_message(chat_id, text)
         logger.info(f"Class alert sent: #{cls['id']} {cls['title']}")
+        return True
     except Exception as e:
         logger.warning(f"Class alert send failed for #{cls['id']}: {e}")
+        return False
 
 
 async def check_goodnight(bot: Bot, now_local: datetime) -> None:
@@ -146,7 +148,7 @@ async def class_notify_loop(bot: Bot) -> None:
             now_tehran = now_local.astimezone(TEHRAN_TZ)
             today_key = now_tehran.date().isoformat()
 
-            if global_enabled:
+            if global_enabled and _group_target() is not None:
                 day = tehran_day_index(now_tehran)
                 classes = await models.get_online_classes(day)
                 for cls in classes:
@@ -161,8 +163,8 @@ async def class_notify_loop(bot: Bot) -> None:
                         continue
                     if await models.class_alert_already_sent(cls["id"], today_key):
                         continue
-                    await send_class_alert(bot, cls, local_tz)
-                    await models.class_alert_mark_sent(cls["id"], today_key)
+                    if await send_class_alert(bot, cls, local_tz):
+                        await models.class_alert_mark_sent(cls["id"], today_key)
 
             await check_goodnight(bot, now_local)
         except asyncio.CancelledError:
