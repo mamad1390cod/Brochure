@@ -1,5 +1,6 @@
 import asyncio
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -59,6 +60,22 @@ def test_drive_service_reports_missing_variable_names_without_values(monkeypatch
     assert "GOOGLE_DRIVE_CLIENT_SECRET" in str(error.value)
     assert "GOOGLE_DRIVE_REFRESH_TOKEN" in str(error.value)
     assert "configured" not in caplog.text
+
+
+def test_drive_service_accepts_cached_naive_oauth_expiry(monkeypatch):
+    monkeypatch.setattr(storage, "GOOGLE_DRIVE_CLIENT_ID", "test-client")
+    monkeypatch.setattr(storage, "GOOGLE_DRIVE_CLIENT_SECRET", "test-secret")
+    monkeypatch.setattr(storage, "GOOGLE_DRIVE_REFRESH_TOKEN", "test-refresh-token")
+    monkeypatch.setattr(storage, "_access_token", "cached-access-token")
+    monkeypatch.setattr(
+        storage,
+        "_access_token_expiry",
+        (datetime.now(timezone.utc) + timedelta(hours=1)).replace(tzinfo=None),
+    )
+
+    service = storage._build_drive_service()
+
+    assert service is not None
 
 
 @pytest.mark.asyncio

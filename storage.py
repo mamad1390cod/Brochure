@@ -52,6 +52,14 @@ class TelegramFileTooLargeError(ValueError):
     """Raised when Telegram's hosted Bot API cannot download the uploaded file."""
 
 
+def _expiry_as_utc(expiry: datetime | None) -> datetime | None:
+    if expiry is None:
+        return None
+    if expiry.tzinfo is None:
+        return expiry.replace(tzinfo=timezone.utc)
+    return expiry.astimezone(timezone.utc)
+
+
 def drive_error_hint(exc: Exception) -> str:
     """Return a safe, actionable summary without logging Google credentials."""
     if isinstance(exc, StorageConfigurationError):
@@ -174,10 +182,11 @@ def _build_drive_service():
         global _access_token, _access_token_expiry
         with _token_lock:
             now = datetime.now(timezone.utc)
+            cached_expiry = _expiry_as_utc(_access_token_expiry)
             if (
                 not _access_token
-                or _access_token_expiry is None
-                or _access_token_expiry <= now + timedelta(minutes=5)
+                or cached_expiry is None
+                or cached_expiry <= now + timedelta(minutes=5)
             ):
                 credentials = Credentials(
                     token=None,
@@ -189,7 +198,7 @@ def _build_drive_service():
                 )
                 credentials.refresh(Request())
                 _access_token = credentials.token
-                _access_token_expiry = credentials.expiry
+                _access_token_expiry = _expiry_as_utc(credentials.expiry)
             credentials = Credentials(
                 token=_access_token,
                 refresh_token=GOOGLE_DRIVE_REFRESH_TOKEN,
@@ -197,7 +206,7 @@ def _build_drive_service():
                 client_id=GOOGLE_DRIVE_CLIENT_ID,
                 client_secret=GOOGLE_DRIVE_CLIENT_SECRET,
                 scopes=[_DRIVE_SCOPE],
-                expiry=_access_token_expiry,
+                expiry=_expiry_as_utc(_access_token_expiry),
             )
         return build(
             "drive",
