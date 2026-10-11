@@ -665,6 +665,12 @@ async def tasks_image_photo_handler(message: Message, state: FSMContext):
             message.from_user.id,
             type(exc).__name__,
         )
+        if isinstance(exc, storage.TelegramFileTooLargeError):
+            await message.answer(
+                "❌ حجم تصویر از سقف دانلود تلگرام (۲۰ مگابایت) بیشتر است. "
+                "لطفاً تصویر کوچک‌تری بفرستید؛ تکلیف ثبت نشد."
+            )
+            return
         await message.answer(
             "❌ ذخیره تصویر در فضای ابری ناموفق بود؛ تکلیف ثبت نشد. "
             "لطفاً کمی بعد دوباره تصویر را ارسال کنید."
@@ -696,6 +702,12 @@ async def tasks_image_document_handler(message: Message, state: FSMContext):
             message.from_user.id,
             type(exc).__name__,
         )
+        if isinstance(exc, storage.TelegramFileTooLargeError):
+            await message.answer(
+                "❌ حجم تصویر از سقف دانلود تلگرام (۲۰ مگابایت) بیشتر است. "
+                "لطفاً تصویر کوچک‌تری بفرستید؛ تکلیف ثبت نشد."
+            )
+            return
         await message.answer(
             "❌ ذخیره تصویر در فضای ابری ناموفق بود؛ تکلیف ثبت نشد. "
             "لطفاً کمی بعد دوباره تصویر را ارسال کنید."

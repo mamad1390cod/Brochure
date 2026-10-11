@@ -19,6 +19,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import FSInputFile, Message
 
 from config import (
+    BOT_TOKEN,
     GOOGLE_DRIVE_CLIENT_ID,
     GOOGLE_DRIVE_CLIENT_SECRET,
     GOOGLE_DRIVE_FOLDER_ID,
@@ -28,6 +29,7 @@ from database import db_session, db_write_session
 from logger import logger
 
 _DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+TELEGRAM_CLOUD_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024
 _TEMP_DIR = Path(tempfile.gettempdir()) / "brochure_drive"
 _MAX_RETRIES = 3
 _token_lock = threading.Lock()
@@ -44,6 +46,10 @@ class StorageConfigurationError(RuntimeError):
 
 class StoredFileNotFoundError(FileNotFoundError):
     """Raised when a file or its private Drive object no longer exists."""
+
+
+class TelegramFileTooLargeError(ValueError):
+    """Raised when Telegram's hosted Bot API cannot download the uploaded file."""
 
 
 def drive_error_hint(exc: Exception) -> str:
@@ -561,6 +567,11 @@ async def upload_telegram_file(
         )
         if remote is not None:
             return existing
+    if file_size and file_size > TELEGRAM_CLOUD_DOWNLOAD_LIMIT_BYTES:
+        raise TelegramFileTooLargeError(
+            "Telegram's hosted Bot API cannot download files larger than 20 MB. "
+            "Send a smaller PDF or configure a local Telegram Bot API server."
+        )
 
     _TEMP_DIR.mkdir(parents=True, exist_ok=True)
     suffix = Path(_safe_filename(original_filename)).suffix[:16]
@@ -568,7 +579,28 @@ async def upload_telegram_file(
     os.close(fd)
     local_path = Path(raw_path)
     try:
-        await bot.download(telegram_file_id, destination=local_path)
+        try:
+            await bot.download(telegram_file_id, destination=local_path)
+        except Exception as exc:
+            message = str(getattr(exc, "message", "") or exc).strip()
+            if BOT_TOKEN:
+                message = message.replace(BOT_TOKEN, "[REDACTED]")
+            message = message.replace(telegram_file_id, "[TELEGRAM_FILE_ID]")
+            lowered = message.lower()
+            if "too big" in lowered or "too large" in lowered:
+                message = (
+                    "Telegram refused to download this file because it exceeds "
+                    "the hosted Bot API download limit (20 MB)."
+                )
+            elif not message:
+                message = "No error message provided by Telegram."
+            logger.error(
+                "Telegram media download failed for %s (%s): %s",
+                purpose,
+                type(exc).__name__,
+                message[:300],
+            )
+            raise
         actual_size = local_path.stat().st_size
         if actual_size <= 0:
             raise ValueError("Telegram returned an empty file.")

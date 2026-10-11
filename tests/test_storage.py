@@ -410,6 +410,39 @@ async def test_telegram_media_downloads_to_temp_and_cleans_up_after_drive_upload
     assert list((tmp_path / "telegram-tmp").iterdir()) == []
 
 
+@pytest.mark.asyncio
+async def test_telegram_cloud_limit_rejects_large_pdf_before_download(
+    app, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        storage, "upload_telegram_file", REAL_UPLOAD_TELEGRAM_FILE
+    )
+    async def no_existing_asset(_source_key):
+        return None
+
+    async def unexpected_download(*args, **kwargs):
+        pytest.fail("Oversized Telegram media must be rejected before download.")
+
+    temp_dir = tmp_path / "telegram-tmp"
+    monkeypatch.setattr(storage, "_find_asset", no_existing_asset)
+    monkeypatch.setattr(storage, "_TEMP_DIR", temp_dir)
+    bot = SimpleNamespace(download=unexpected_download)
+
+    with pytest.raises(storage.TelegramFileTooLargeError, match="20 MB"):
+        await storage.upload_telegram_file(
+            bot,
+            telegram_file_id="large-pdf-file-id",
+            telegram_file_unique_id="large-pdf-unique-id",
+            original_filename="lesson.pdf",
+            mime_type="application/pdf",
+            file_size=storage.TELEGRAM_CLOUD_DOWNLOAD_LIMIT_BYTES + 1,
+            uploaded_by=321,
+            purpose="note",
+        )
+
+    assert not temp_dir.exists()
+
+
 def test_database_path_migration_copies_without_overwriting_or_modifying_source(
     tmp_path,
 ):

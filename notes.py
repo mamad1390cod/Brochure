@@ -349,6 +349,13 @@ async def submit_receive_file(message: Message, state: FSMContext):
             message.from_user.id,
             type(exc).__name__,
         )
+        if isinstance(exc, storage.TelegramFileTooLargeError):
+            await message.answer(
+                "❌ حجم فایل بیشتر از سقف دانلود تلگرام (۲۰ مگابایت) است. "
+                "لطفاً PDF را کوچک‌تر کنید و دوباره بفرستید؛ "
+                "فایل در Drive ذخیره نشده و جزوه ثبت نشد."
+            )
+            return
         await message.answer(
             "❌ ذخیره فایل در فضای ابری ناموفق بود؛ جزوه ثبت نشد. "
             "لطفاً کمی بعد دوباره فایل را ارسال کنید."
