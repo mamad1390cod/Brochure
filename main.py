@@ -28,6 +28,7 @@ except Exception:
     logger.exception("Bot configuration could not be loaded.")
     raise
 from database import init_database
+import storage
 from handlers import router as main_router, set_bot_instance
 from notes import router as notes_router
 from admin import router as admin_router
@@ -62,6 +63,14 @@ async def on_startup(bot: Bot):
     # Initialize database
     await init_database()
     logger.info("Database initialized.")
+    try:
+        await storage.check_drive_ready()
+    except Exception as exc:
+        logger.warning(
+            "The bot will continue without cloud uploads until Google Drive "
+            "configuration is corrected: %s",
+            storage.drive_error_hint(exc),
+        )
 
     # Set bot commands (Telegram only accepts a-z, 0-9 and _ in command names;
     # the Persian /جزوه command still works when typed but cannot appear here)

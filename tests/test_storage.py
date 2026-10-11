@@ -15,6 +15,50 @@ from database import db_session
 
 REAL_UPLOAD_FILE = storage.upload_file
 REAL_UPLOAD_TELEGRAM_FILE = storage.upload_telegram_file
+REAL_CHECK_DRIVE_READY = storage.check_drive_ready
+
+
+def test_drive_error_hint_explains_missing_oauth_variables():
+    error = storage.StorageConfigurationError(
+        "Missing required Google Drive Railway variables: "
+        "GOOGLE_DRIVE_REFRESH_TOKEN"
+    )
+    assert storage.drive_error_hint(error) == str(error)
+
+
+def test_drive_error_hint_explains_expired_refresh_token():
+    error = RuntimeError("invalid_grant: Token has been expired or revoked.")
+    assert "expired or revoked" in storage.drive_error_hint(error)
+    assert "GOOGLE_DRIVE_REFRESH_TOKEN" in storage.drive_error_hint(error)
+
+
+def test_drive_error_hint_explains_full_google_storage_quota():
+    error = RuntimeError('{"error":{"errors":[{"reason":"storageQuotaExceeded"}]}}')
+    assert "no available Drive storage quota" in storage.drive_error_hint(error)
+
+
+def test_drive_error_hint_does_not_include_raw_api_error_text():
+    class FakeHttpError(Exception):
+        def __init__(self):
+            super().__init__("sensitive response text")
+            self.resp = SimpleNamespace(status=403)
+
+    hint = storage.drive_error_hint(FakeHttpError())
+    assert "denied access" in hint
+    assert "sensitive response text" not in hint
+
+
+def test_drive_service_reports_missing_variable_names_without_values(monkeypatch, caplog):
+    monkeypatch.setattr(storage, "GOOGLE_DRIVE_CLIENT_ID", "configured")
+    monkeypatch.setattr(storage, "GOOGLE_DRIVE_CLIENT_SECRET", "")
+    monkeypatch.setattr(storage, "GOOGLE_DRIVE_REFRESH_TOKEN", "")
+
+    with pytest.raises(storage.StorageConfigurationError) as error:
+        storage._build_drive_service()
+
+    assert "GOOGLE_DRIVE_CLIENT_SECRET" in str(error.value)
+    assert "GOOGLE_DRIVE_REFRESH_TOKEN" in str(error.value)
+    assert "configured" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -97,6 +141,34 @@ async def test_upload_persists_drive_metadata_and_reuses_existing_file(
             ("telegram:unique-lesson",),
         )
     assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_drive_startup_check_verifies_oauth_and_folder(monkeypatch):
+    checked = []
+    monkeypatch.setattr(storage, "check_drive_ready", REAL_CHECK_DRIVE_READY)
+    monkeypatch.setattr(storage, "_check_drive_ready_sync", lambda: checked.append(True))
+
+    await storage.check_drive_ready()
+
+    assert checked == [True]
+
+
+@pytest.mark.asyncio
+async def test_drive_startup_check_logs_actionable_failure(monkeypatch, caplog):
+    monkeypatch.setattr(storage, "check_drive_ready", REAL_CHECK_DRIVE_READY)
+
+    def fail_check():
+        raise storage.StorageConfigurationError(
+            "Missing required Google Drive Railway variables: GOOGLE_DRIVE_REFRESH_TOKEN"
+        )
+
+    monkeypatch.setattr(storage, "_check_drive_ready_sync", fail_check)
+    with pytest.raises(RuntimeError, match="GOOGLE_DRIVE_REFRESH_TOKEN"):
+        await storage.check_drive_ready()
+
+    assert "Google Drive startup check failed" in caplog.text
+    assert "GOOGLE_DRIVE_REFRESH_TOKEN" in caplog.text
 
 
 @pytest.mark.asyncio

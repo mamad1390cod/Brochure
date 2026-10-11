@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import json
 import mimetypes
 import os
 import tempfile
@@ -45,6 +46,76 @@ class StoredFileNotFoundError(FileNotFoundError):
     """Raised when a file or its private Drive object no longer exists."""
 
 
+def drive_error_hint(exc: Exception) -> str:
+    """Return a safe, actionable summary without logging Google credentials."""
+    if isinstance(exc, StorageConfigurationError):
+        return str(exc)
+
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    reason = ""
+    details = getattr(exc, "error_details", None)
+    if isinstance(details, list):
+        for detail in details:
+            if isinstance(detail, dict):
+                reason = " ".join(
+                    str(detail.get(key, "")) for key in ("reason", "message")
+                ).lower()
+                if reason:
+                    break
+
+    content = getattr(exc, "content", b"")
+    if not reason and content:
+        try:
+            payload = json.loads(
+                content.decode("utf-8") if isinstance(content, bytes) else content
+            )
+            error = payload.get("error", {})
+            if isinstance(error, dict):
+                errors = error.get("errors", [])
+                if errors and isinstance(errors[0], dict):
+                    reason = str(errors[0].get("reason", "")).lower()
+                reason = f"{reason} {error.get('status', '')}".lower()
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+    if not reason:
+        reason = " ".join(str(arg) for arg in exc.args).lower()
+    if "invalid_grant" in reason:
+        return (
+            "Google OAuth refresh token is expired or revoked; repeat the "
+            "consent flow and update GOOGLE_DRIVE_REFRESH_TOKEN in Railway."
+        )
+    if "invalid_client" in reason:
+        return (
+            "Google OAuth client credentials are rejected; verify "
+            "GOOGLE_DRIVE_CLIENT_ID and GOOGLE_DRIVE_CLIENT_SECRET in Railway."
+        )
+    if any(term in reason for term in ("accessnotconfigured", "service_disabled")):
+        return "Google Drive API is not enabled for the configured Google Cloud project."
+    if "storagequotaexceeded" in reason:
+        return "The Google account has no available Drive storage quota."
+    if any(term in reason for term in ("ratelimit", "userratelimit")) or status == 429:
+        return "Google Drive rate limit reached; retry after the quota window."
+    if any(
+        term in reason
+        for term in ("insufficientpermissions", "permissiondenied", "forbidden")
+    ) or status == 403:
+        return (
+            "Google Drive denied access; verify OAuth consent, folder access, "
+            "and account storage quota."
+        )
+    if status == 404:
+        return "The configured Google Drive folder or file was not found or is inaccessible."
+    if status is not None and status >= 500:
+        return f"Google Drive is temporarily unavailable (HTTP {status})."
+    if status == 401:
+        return (
+            "Google Drive rejected authorization; verify the refresh token and "
+            "OAuth client configuration."
+        )
+    return f"Google Drive operation failed ({type(exc).__name__})."
+
+
 @dataclass(frozen=True)
 class StoredFile:
     id: str
@@ -72,18 +143,22 @@ def _safe_filename(filename: str) -> str:
 
 
 def _build_drive_service():
-    if not all(
-        (
-            GOOGLE_DRIVE_CLIENT_ID,
-            GOOGLE_DRIVE_CLIENT_SECRET,
-            GOOGLE_DRIVE_REFRESH_TOKEN,
+    missing = [
+        name
+        for name, value in (
+            ("GOOGLE_DRIVE_CLIENT_ID", GOOGLE_DRIVE_CLIENT_ID),
+            ("GOOGLE_DRIVE_CLIENT_SECRET", GOOGLE_DRIVE_CLIENT_SECRET),
+            ("GOOGLE_DRIVE_REFRESH_TOKEN", GOOGLE_DRIVE_REFRESH_TOKEN),
         )
-    ):
-        raise StorageConfigurationError(
-            "Google Drive OAuth is not configured. Set "
-            "GOOGLE_DRIVE_CLIENT_ID, GOOGLE_DRIVE_CLIENT_SECRET, and "
-            "GOOGLE_DRIVE_REFRESH_TOKEN."
+        if not value
+    ]
+    if missing:
+        error = StorageConfigurationError(
+            "Missing required Google Drive Railway variables: "
+            + ", ".join(missing)
         )
+        logger.error("%s", error)
+        raise error
 
     try:
         from google.auth.transport.requests import Request
@@ -127,10 +202,37 @@ def _build_drive_service():
     except StorageConfigurationError:
         raise
     except Exception as exc:
-        logger.error("Google Drive authentication failed (%s)", type(exc).__name__)
+        logger.error("Google Drive authentication failed: %s", drive_error_hint(exc))
         raise StorageConfigurationError(
-            "Google Drive authentication failed; verify OAuth variables and consent."
+            "Google Drive authentication failed: " + drive_error_hint(exc)
         ) from exc
+
+
+def _check_drive_ready_sync() -> None:
+    service = _build_drive_service()
+    if GOOGLE_DRIVE_FOLDER_ID:
+        folder = service.files().get(
+            fileId=GOOGLE_DRIVE_FOLDER_ID,
+            fields="id,mimeType",
+            supportsAllDrives=True,
+        ).execute(num_retries=_MAX_RETRIES)
+        if folder.get("mimeType") != "application/vnd.google-apps.folder":
+            raise StorageConfigurationError(
+                "GOOGLE_DRIVE_FOLDER_ID does not identify an accessible Drive folder."
+            )
+    else:
+        _get_or_create_app_folder(service)
+
+
+async def check_drive_ready() -> None:
+    """Verify OAuth and the configured private folder during startup."""
+    try:
+        await asyncio.to_thread(_check_drive_ready_sync)
+    except Exception as exc:
+        hint = drive_error_hint(exc)
+        logger.error("Google Drive startup check failed: %s", hint)
+        raise RuntimeError(hint) from exc
+    logger.info("Google Drive OAuth and storage folder are ready.")
 
 
 def _drive_idempotency_key(source_key: str) -> str:
@@ -289,16 +391,20 @@ def _upload_local_file_sync(
     original_filename: str,
     mime_type: str,
 ) -> dict:
-    service = _build_drive_service()
-    remote = _find_remote_file(service, source_key)
-    if remote is not None:
-        verified = _get_remote_metadata(service, remote["id"])
-        if verified is not None:
-            return verified
+    try:
+        service = _build_drive_service()
+        remote = _find_remote_file(service, source_key)
+        if remote is not None:
+            verified = _get_remote_metadata(service, remote["id"])
+            if verified is not None:
+                return verified
+        folder_id = _get_or_create_app_folder(service)
+    except Exception as exc:
+        logger.error("Google Drive upload preparation failed: %s", drive_error_hint(exc))
+        raise
 
     from googleapiclient.http import MediaFileUpload
 
-    folder_id = _get_or_create_app_folder(service)
     metadata: dict = {
         "name": _safe_filename(original_filename),
         "mimeType": mime_type or "application/octet-stream",
@@ -351,9 +457,9 @@ def _upload_local_file_sync(
                 time.sleep(min(2**attempt, 8))
 
     logger.error(
-        "Google Drive upload failed for source %s (%s)",
+        "Google Drive upload failed for source %s: %s",
         _drive_idempotency_key(source_key)[:12],
-        type(last_error).__name__ if last_error else "unknown",
+        drive_error_hint(last_error or RuntimeError("Unknown Drive upload error")),
     )
     raise RuntimeError("Google Drive upload failed after retries.") from last_error
 

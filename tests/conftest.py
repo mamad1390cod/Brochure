@@ -408,6 +408,9 @@ async def _runtime():
     import storage
     from types import SimpleNamespace
 
+    async def _drive_ready():
+        return None
+
     async def _fake_drive_upload(_bot, **kwargs):
         telegram_id = kwargs["telegram_file_id"]
         return SimpleNamespace(
@@ -424,6 +427,7 @@ async def _runtime():
     mp.setattr(storage, "upload_telegram_file", _fake_drive_upload)
     mp.setattr(storage, "upload_file", _fake_file_upload)
     mp.setattr(storage, "upload_generated_file", _fake_file_upload)
+    mp.setattr(storage, "check_drive_ready", _drive_ready)
     mp.setattr(main_mod, "start_nudge_scheduler", lambda b: None)
     mp.setattr(main_mod, "start_class_notifier", lambda b: None)
 
