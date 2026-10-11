@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS notes (
     file_name TEXT,
     mime_type TEXT,
     file_size INTEGER DEFAULT 0,
+    storage_file_id TEXT,
     submitted_by INTEGER NOT NULL,
     submitted_by_name TEXT DEFAULT '',
     status TEXT DEFAULT 'pending',
@@ -297,10 +298,31 @@ CREATE TABLE IF NOT EXISTS tasks (
     day_index INTEGER,
     due_at TEXT,
     file_id TEXT,
+    storage_file_id TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     is_active INTEGER DEFAULT 1,
     FOREIGN KEY (category_id) REFERENCES task_categories(id) ON DELETE CASCADE
 );
+
+-- Metadata for private files stored outside SQLite (Google Drive).
+CREATE TABLE IF NOT EXISTS stored_files (
+    id TEXT PRIMARY KEY,
+    drive_file_id TEXT NOT NULL UNIQUE,
+    source_key TEXT NOT NULL UNIQUE,
+    telegram_file_id TEXT DEFAULT '',
+    telegram_file_unique_id TEXT DEFAULT '',
+    original_filename TEXT NOT NULL,
+    mime_type TEXT DEFAULT 'application/octet-stream',
+    file_size INTEGER,
+    md5_checksum TEXT DEFAULT '',
+    uploaded_by INTEGER,
+    purpose TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    verified_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_stored_files_uploader
+    ON stored_files(uploaded_by, created_at);
 
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_notes_field ON notes(field_id);
@@ -334,6 +356,8 @@ COLUMN_MIGRATIONS = [
     ("tasks", "day_index", "INTEGER"),
     ("tasks", "due_at", "TEXT"),
     ("tasks", "file_id", "TEXT"),
+    ("notes", "storage_file_id", "TEXT"),
+    ("tasks", "storage_file_id", "TEXT"),
 ]
 
 

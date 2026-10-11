@@ -65,7 +65,19 @@ if _group_id:
 
 # ─── Database ─────────────────────────────────────────────────────────────────
 
-DATABASE_PATH: Path = BASE_DIR / _get_env("DATABASE_PATH", default="data/school_notes.db")
+_database_path = Path(
+    _get_env("DATABASE_PATH", default="data/school_notes.db")
+).expanduser()
+DATABASE_PATH: Path = (
+    _database_path if _database_path.is_absolute() else BASE_DIR / _database_path
+)
+
+# Google Drive OAuth credentials. Configure all required values in Railway;
+# none are committed to source control.
+GOOGLE_DRIVE_CLIENT_ID: str = _get_env("GOOGLE_DRIVE_CLIENT_ID")
+GOOGLE_DRIVE_CLIENT_SECRET: str = _get_env("GOOGLE_DRIVE_CLIENT_SECRET")
+GOOGLE_DRIVE_REFRESH_TOKEN: str = _get_env("GOOGLE_DRIVE_REFRESH_TOKEN")
+GOOGLE_DRIVE_FOLDER_ID: str = _get_env("GOOGLE_DRIVE_FOLDER_ID")
 
 # ─── Security ─────────────────────────────────────────────────────────────────
 

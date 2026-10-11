@@ -18,6 +18,7 @@ import uuid
 
 import models
 import keyboards
+import storage
 import security
 from config import MAIN_ADMIN_ID, ADMIN_PASSWORD, MAX_LOGIN_ATTEMPTS, LOGIN_LOCKOUT_MINUTES
 from permissions import check_permission, is_admin, is_main_admin, is_owner, PERMISSIONS, DEFAULT_ADMIN_PERMISSIONS
@@ -1414,28 +1415,20 @@ async def note_download_handler(callback: CallbackQuery):
 
     file_type = note["file_type"]
     try:
-        if file_type == "photo":
-            await callback.message.answer_photo(
-                note["file_id"], caption=f"📄 {escape_html(note['title'])}"
-            )
-        elif file_type == "video":
-            await callback.message.answer_video(
-                note["file_id"], caption=f"📄 {escape_html(note['title'])}"
-            )
-        elif file_type in ("document", "audio"):
-            await callback.message.answer_document(
-                note["file_id"], caption=f"📄 {escape_html(note['title'])}"
-            )
-        elif file_type == "voice":
-            await callback.message.answer_voice(
-                note["file_id"], caption=f"📄 {escape_html(note['title'])}"
-            )
-        else:
-            await callback.message.answer_document(
-                note["file_id"], caption=f"📄 {escape_html(note['title'])}"
-            )
-    except Exception as e:
-        await callback.answer(f"❌ خطا در ارسال فایل: {e}", show_alert=True)
+        await storage.send_stored_file(
+            callback.message,
+            telegram_file_id=note["file_id"],
+            storage_file_id=note["storage_file_id"],
+            file_type=file_type,
+            caption=f"📄 {escape_html(note['title'])}",
+        )
+    except Exception as exc:
+        logger.warning(
+            "Admin note download failed for note %s (%s)",
+            note_id,
+            type(exc).__name__,
+        )
+        await callback.answer("❌ فایل در دسترس نیست؛ لطفاً بعداً تلاش کنید.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("note_delete:"))
@@ -1937,19 +1930,63 @@ async def logs_pdf_handler(callback: CallbackQuery):
     doc.save(docx_path)
     try:
         out_pdf = convert.word_to_pdf(docx_path, out_dir)
+    except RuntimeError as exc:
+        try:
+            await storage.upload_generated_file(
+                docx_path,
+                uploaded_by=callback.from_user.id,
+                purpose="admin_log_export",
+                mime_type=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document"
+                ),
+            )
+            await callback.message.answer_document(
+                FSInputFile(docx_path),
+                caption=f"📤 خروجی لاگ‌ها (Word)\n{exc}",
+            )
+            await models.add_log(
+                callback.from_user.id,
+                callback.from_user.username or "",
+                "export_logs_pdf",
+                f"{len(logs)} rows (DOCX fallback)",
+            )
+        except Exception as upload_exc:
+            logger.error(
+                "Admin log report storage/delivery failed for user %s (%s)",
+                callback.from_user.id,
+                type(upload_exc).__name__,
+            )
+            await callback.answer(
+                "❌ ذخیره یا ارسال گزارش ناموفق بود.", show_alert=True
+            )
+        finally:
+            docx_path.unlink(missing_ok=True)
+        return
+
+    try:
+        await storage.upload_generated_file(
+            out_pdf,
+            uploaded_by=callback.from_user.id,
+            purpose="admin_log_export",
+            mime_type="application/pdf",
+        )
         await callback.message.answer_document(
             FSInputFile(out_pdf), caption="📤 خروجی PDF لاگ‌ها")
         docx_path.unlink(missing_ok=True)
         out_pdf.unlink(missing_ok=True)
         await models.add_log(callback.from_user.id, callback.from_user.username or "",
                              "export_logs_pdf", f"{len(logs)} rows")
-    except RuntimeError as e:
-        # LibreOffice missing -> send the DOCX so the admin still gets output
-        await callback.message.answer_document(
-            FSInputFile(docx_path), caption=f"📤 خروجی لاگ‌ها (Word)\n{e}")
-        docx_path.unlink(missing_ok=True)
     except Exception as e:
-        await callback.answer(f"❌ خطا در تولید خروجی: {e}", show_alert=True)
+        logger.error(
+            "Admin log PDF storage/delivery failed for user %s (%s)",
+            callback.from_user.id,
+            type(e).__name__,
+        )
+        await callback.answer("❌ ذخیره یا ارسال گزارش ناموفق بود.", show_alert=True)
+    finally:
+        docx_path.unlink(missing_ok=True)
+        out_pdf.unlink(missing_ok=True)
 
 
 @router.callback_query(F.data.startswith("perm_toggle:"))
@@ -3149,18 +3186,48 @@ async def admin_convert_start_handler(callback: CallbackQuery, state: FSMContext
 @router.message(StateFilter(AdminConvertFlow.waiting_files), F.photo)
 async def admin_convert_photo(message: Message, state: FSMContext):
     import hashlib
-    dest = Path(convert.TEMP_DIR); dest.mkdir(parents=True, exist_ok=True)
+    dest = Path(convert.TEMP_DIR)
+    dest.mkdir(parents=True, exist_ok=True)
     fname = f"adm_{hashlib.md5(str(message.message_id).encode()).hexdigest()[:14]}.jpg"
     path = dest / fname
-    await message.bot.download(message.photo[-1], destination=path)
-    data = await state.get_data()
-    paths = data.get("img_paths", []) or []
-    paths.append(str(path))
-    await state.update_data(img_paths=paths)
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text=f"🧷 تبدیل به PDF ({len(paths)} عکس)", callback_data="admin_convert_done"))
-    kb.row(InlineKeyboardButton(text="❌ لغو عملیات", callback_data="tools_cancel"))
-    await message.answer(f"عکس {len(paths)} اضافه شد. عکس بعدی را بفرستید یا تبدیل را بزنید:", reply_markup=kb.as_markup())
+    photo = message.photo[-1]
+    try:
+        await message.bot.download(photo, destination=path)
+        await storage.upload_file(
+            path,
+            source_key=storage.telegram_source_key(
+                photo.file_id, photo.file_unique_id
+            ),
+            original_filename=fname,
+            mime_type="image/jpeg",
+            telegram_file_id=photo.file_id,
+            telegram_file_unique_id=photo.file_unique_id,
+            uploaded_by=message.from_user.id,
+            purpose="admin_conversion_input",
+        )
+    except Exception as exc:
+        path.unlink(missing_ok=True)
+        logger.error(
+            "Admin conversion image storage failed for user %s (%s)",
+            message.from_user.id,
+            type(exc).__name__,
+        )
+        await message.answer(
+            "❌ دریافت یا ذخیره تصویر در فضای ابری ناموفق بود؛ دوباره تلاش کنید."
+        )
+        return
+    try:
+        data = await state.get_data()
+        paths = data.get("img_paths", []) or []
+        paths.append(str(path))
+        await state.update_data(img_paths=paths)
+        kb = InlineKeyboardBuilder()
+        kb.row(InlineKeyboardButton(text=f"🧷 تبدیل به PDF ({len(paths)} عکس)", callback_data="admin_convert_done"))
+        kb.row(InlineKeyboardButton(text="❌ لغو عملیات", callback_data="tools_cancel"))
+        await message.answer(f"عکس {len(paths)} اضافه شد. عکس بعدی را بفرستید یا تبدیل را بزنید:", reply_markup=kb.as_markup())
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
 
 
 @router.callback_query(F.data == "admin_convert_done")
@@ -3193,8 +3260,25 @@ async def admin_convert_name(message: Message, state: FSMContext):
         return
     await state.clear()
     try:
+        await storage.upload_generated_file(
+            out,
+            uploaded_by=message.from_user.id,
+            purpose="admin_generated_pdf",
+            mime_type="application/pdf",
+        )
         await message.answer_document(
             FSInputFile(out), caption=f"📄 {name}.pdf ✅")
+    except Exception as exc:
+        logger.error(
+            "Admin generated PDF storage or delivery failed for user %s (%s)",
+            message.from_user.id,
+            type(exc).__name__,
+        )
+        await message.answer(
+            "❌ ذخیره یا ارسال PDF ناموفق بود. "
+            "اگر ذخیره‌ی ابری موفق شده باشد، نسخه در فضای ابری باقی می‌ماند."
+        )
+        return
     finally:
         for p in data["img_paths"]:
             Path(p).unlink(missing_ok=True)
@@ -3422,16 +3506,55 @@ async def stats_pdf_handler(callback: CallbackQuery):
     doc.save(docx_path)
     try:
         out_pdf = convert.word_to_pdf(docx_path, out_dir)
+    except RuntimeError as exc:
+        try:
+            await storage.upload_generated_file(
+                docx_path,
+                uploaded_by=callback.from_user.id,
+                purpose="admin_stats_export",
+                mime_type=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document"
+                ),
+            )
+            await callback.message.answer_document(
+                FSInputFile(docx_path),
+                caption=f"📊 گزارش آماری (Word)\n{exc}",
+            )
+        except Exception as upload_exc:
+            logger.error(
+                "Admin stats report storage/delivery failed for user %s (%s)",
+                callback.from_user.id,
+                type(upload_exc).__name__,
+            )
+            await callback.answer(
+                "❌ ذخیره یا ارسال گزارش ناموفق بود.", show_alert=True
+            )
+        finally:
+            docx_path.unlink(missing_ok=True)
+        return
+
+    try:
+        await storage.upload_generated_file(
+            out_pdf,
+            uploaded_by=callback.from_user.id,
+            purpose="admin_stats_export",
+            mime_type="application/pdf",
+        )
         await callback.message.answer_document(
             FSInputFile(out_pdf), caption="📊 گزارش آماری ربات (PDF)")
         docx_path.unlink(missing_ok=True)
         out_pdf.unlink(missing_ok=True)
-    except RuntimeError as e:
-        await callback.message.answer_document(
-            FSInputFile(docx_path), caption=f"📊 گزارش آماری (Word)\n{e}")
-        docx_path.unlink(missing_ok=True)
     except Exception as e:
-        await callback.answer(f"❌ خطا: {e}", show_alert=True)
+        logger.error(
+            "Admin stats PDF storage/delivery failed for user %s (%s)",
+            callback.from_user.id,
+            type(e).__name__,
+        )
+        await callback.answer("❌ ذخیره یا ارسال گزارش ناموفق بود.", show_alert=True)
+    finally:
+        docx_path.unlink(missing_ok=True)
+        out_pdf.unlink(missing_ok=True)
     await models.add_log(callback.from_user.id, callback.from_user.username or "",
                          "export_stats_pdf", "stats report")
 

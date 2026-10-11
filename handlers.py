@@ -15,6 +15,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import models
 import keyboards
+import storage
 from config import ALLOWED_GROUP_ID, MAIN_ADMIN_ID
 from permissions import is_admin
 from utils import escape_html
@@ -427,18 +428,20 @@ async def user_download_handler(callback: CallbackQuery):
         return
 
     try:
-        if note["file_type"] == "photo":
-            await callback.message.answer_photo(note["file_id"], caption=f"📄 {note['title']}")
-        elif note["file_type"] == "video":
-            await callback.message.answer_video(note["file_id"], caption=f"📄 {note['title']}")
-        elif note["file_type"] in ("document", "audio"):
-            await callback.message.answer_document(note["file_id"], caption=f"📄 {note['title']}")
-        elif note["file_type"] == "voice":
-            await callback.message.answer_voice(note["file_id"], caption=f"📄 {note['title']}")
-        else:
-            await callback.message.answer_document(note["file_id"], caption=f"📄 {note['title']}")
-    except Exception as e:
-        await callback.answer(f"❌ خطا در ارسال فایل: {e}", show_alert=True)
+        await storage.send_stored_file(
+            callback.message,
+            telegram_file_id=note["file_id"],
+            storage_file_id=note["storage_file_id"],
+            file_type=note["file_type"],
+            caption=f"📄 {note['title']}",
+        )
+    except Exception as exc:
+        logger.warning(
+            "Note download failed for note %s (%s)",
+            note_id,
+            type(exc).__name__,
+        )
+        await callback.answer("❌ فایل در دسترس نیست؛ لطفاً بعداً تلاش کنید.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("user_field_back:"))

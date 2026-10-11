@@ -200,6 +200,10 @@ group.
 | `ADMIN_PASSWORD` | Main admin password |
 | `ALLOWED_GROUP_ID` | Restrict bot to specific group |
 | `DATABASE_PATH` | SQLite database path |
+| `GOOGLE_DRIVE_CLIENT_ID` | Google OAuth client ID for private media storage |
+| `GOOGLE_DRIVE_CLIENT_SECRET` | Google OAuth client secret |
+| `GOOGLE_DRIVE_REFRESH_TOKEN` | Google OAuth refresh token |
+| `GOOGLE_DRIVE_FOLDER_ID` | Optional private Drive folder ID |
 | `ENABLE_INLINE_SEARCH` | Enable inline search |
 | `INLINE_SEARCH_ALLOWED_USERS` | Comma-separated user IDs |
 | `MAX_LOGIN_ATTEMPTS` | Max failed login attempts |
@@ -218,18 +222,22 @@ a transaction-consistent SQLite snapshot at `database/main_database.db` and a
 integrity-check results. The snapshot uses SQLite's online backup API, so it
 also includes committed data held in the WAL.
 
-Archives are written under `data/backups/`. The most recent successfully sent
-archive is retained locally; older archives are removed only after a newer
-archive has been checked and delivered. If delivery fails, that archive is
-retained and the owner is notified when possible. A later successful delivery
-replaces the prior local archive.
+Archives are written to the operating system's temporary directory, not the
+Railway persistent volume. The most recent successfully sent archive is
+retained temporarily; older archives are removed only after a newer archive
+has been checked and delivered. If delivery fails, that archive is retained
+and the owner is notified when possible. A later successful delivery replaces
+the prior local archive.
 
-Note and homework media are stored by Telegram and referenced by file IDs in
-SQLite; the project does not persist those uploads in a local media directory.
-Temporary conversion files, logs, source code, `.env`, and other secrets are
-not included in the archive. Restore by extracting the snapshot database and
-using it as the configured database file; the bot token and other secrets
-must be configured separately and are never backed up.
+Note and homework media are stored privately in Google Drive and referenced
+from SQLite; the original Telegram file IDs remain available for compatibility.
+See [Google Drive and Railway deployment](GOOGLE_DRIVE_SETUP.md) for OAuth
+configuration, persistent-volume migration, and resumable migration of existing
+Telegram-hosted media. Temporary conversion files, logs, source code, `.env`,
+and other secrets are not included in backups.
+Restore by extracting the snapshot database and using it as the configured
+database file; the bot token and other secrets must be configured separately
+and are never backed up.
 
 ## 📄 Supported File Types
 

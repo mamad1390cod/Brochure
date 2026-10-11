@@ -23,6 +23,7 @@ from aiogram.filters import StateFilter
 import models
 import keyboards
 import convert
+import storage
 from logger import logger
 
 router = Router()
@@ -253,6 +254,12 @@ async def _finish_image_pdf(
             convert.images_to_pdf([Path(path) for path in image_paths], output)
             if output.stat().st_size > MAX_OUTPUT_PDF_BYTES:
                 raise ValueError("حجم PDF از حد مجاز تلگرام بیشتر شد.")
+            await storage.upload_generated_file(
+                output,
+                uploaded_by=message.from_user.id,
+                purpose="generated_pdf",
+                mime_type="application/pdf",
+            )
             await message.answer_document(
                 FSInputFile(output), caption="📄 فایل PDF آماده شد ✅")
             try:
@@ -329,17 +336,7 @@ async def _handle_image_input(message: Message, state: FSMContext, single: bool)
             await message.answer("❌ دریافت تصویر ناموفق بود. دوباره تلاش کنید.")
             return
 
-        if single:
-            paths = [str(path)]
-            await state.set_state(FileToolsFlow.finalizing_images)
-            await state.update_data(
-                img_paths=paths,
-                conversion_phase="finalizing",
-                back_to=_back_to(await state.get_data()),
-            )
-            back_to = _back_to(await state.get_data())
-            single_job = (paths, back_to)
-        else:
+        if not single:
             data = await state.get_data()
             total_size = int(data.get("img_total_bytes", 0)) + path.stat().st_size
             if total_size > MAX_TOTAL_IMAGE_BYTES:
@@ -356,6 +353,49 @@ async def _handle_image_input(message: Message, state: FSMContext, single: bool)
                 )
                 return
 
+        if isinstance(image, Document):
+            file_name = image.file_name or f"image_{image.file_unique_id}"
+            mime_type = image.mime_type
+        else:
+            file_name = f"photo_{image.file_unique_id}.jpg"
+            mime_type = "image/jpeg"
+        try:
+            await storage.upload_file(
+                path,
+                source_key=storage.telegram_source_key(
+                    image.file_id, image.file_unique_id
+                ),
+                original_filename=file_name,
+                mime_type=mime_type,
+                telegram_file_id=image.file_id,
+                telegram_file_unique_id=image.file_unique_id,
+                uploaded_by=message.from_user.id,
+                purpose="conversion_input",
+            )
+        except Exception as exc:
+            path.unlink(missing_ok=True)
+            logger.error(
+                "Conversion image storage failed for user %s (%s)",
+                message.from_user.id,
+                type(exc).__name__,
+            )
+            await message.answer(
+                "❌ ذخیره تصویر در فضای ابری ناموفق بود؛ "
+                "لطفاً کمی بعد دوباره تلاش کنید."
+            )
+            return
+
+        if single:
+            paths = [str(path)]
+            await state.set_state(FileToolsFlow.finalizing_images)
+            await state.update_data(
+                img_paths=paths,
+                conversion_phase="finalizing",
+                back_to=_back_to(await state.get_data()),
+            )
+            back_to = _back_to(await state.get_data())
+            single_job = (paths, back_to)
+        else:
             paths.append(str(path))
             await state.update_data(
                 img_paths=paths,
@@ -443,6 +483,31 @@ async def tool_word_receive(message: Message, state: FSMContext):
         logger.warning(f"Word download failed for user {message.from_user.id}: {e}")
         await message.answer("❌ دریافت فایل ناموفق بود. دوباره ارسال کنید:")
         return
+    try:
+        await storage.upload_file(
+            src,
+            source_key=storage.telegram_source_key(
+                doc.file_id, doc.file_unique_id
+            ),
+            original_filename=doc.file_name or "document.docx",
+            mime_type=doc.mime_type,
+            telegram_file_id=doc.file_id,
+            telegram_file_unique_id=doc.file_unique_id,
+            uploaded_by=message.from_user.id,
+            purpose="conversion_input",
+        )
+    except Exception as exc:
+        src.unlink(missing_ok=True)
+        logger.error(
+            "Word input storage failed for user %s (%s)",
+            message.from_user.id,
+            type(exc).__name__,
+        )
+        await message.answer(
+            "❌ ذخیره فایل در فضای ابری ناموفق بود؛ تبدیل انجام نشد. "
+            "لطفاً کمی بعد دوباره تلاش کنید."
+        )
+        return
     await state.clear()
     try:
         out_pdf = convert.word_to_pdf(src, dest_dir)
@@ -452,6 +517,12 @@ async def tool_word_receive(message: Message, state: FSMContext):
         (dest_dir / f"{src.stem}.pdf").unlink(missing_ok=True)
         return
     try:
+        await storage.upload_generated_file(
+            out_pdf,
+            uploaded_by=message.from_user.id,
+            purpose="generated_pdf",
+            mime_type="application/pdf",
+        )
         await message.answer_document(
             FSInputFile(out_pdf), caption="✅ فایل PDF آماده شد")
         await models.add_convert_job(message.from_user.id, "docx", "pdf", output_type=out_pdf.name)
@@ -493,6 +564,31 @@ async def tool_pdf_receive(message: Message, state: FSMContext):
         logger.warning(f"PDF download failed for user {message.from_user.id}: {e}")
         await message.answer("❌ دریافت فایل ناموفق بود. دوباره ارسال کنید:")
         return
+    try:
+        await storage.upload_file(
+            src,
+            source_key=storage.telegram_source_key(
+                doc.file_id, doc.file_unique_id
+            ),
+            original_filename=doc.file_name or "document.pdf",
+            mime_type=doc.mime_type or "application/pdf",
+            telegram_file_id=doc.file_id,
+            telegram_file_unique_id=doc.file_unique_id,
+            uploaded_by=message.from_user.id,
+            purpose="conversion_input",
+        )
+    except Exception as exc:
+        src.unlink(missing_ok=True)
+        logger.error(
+            "PDF input storage failed for user %s (%s)",
+            message.from_user.id,
+            type(exc).__name__,
+        )
+        await message.answer(
+            "❌ ذخیره فایل در فضای ابری ناموفق بود؛ تبدیل انجام نشد. "
+            "لطفاً کمی بعد دوباره تلاش کنید."
+        )
+        return
     await state.clear()
     out = dest_dir / (src.stem + ".docx")
     try:
@@ -503,6 +599,15 @@ async def tool_pdf_receive(message: Message, state: FSMContext):
         out.unlink(missing_ok=True)
         return
     try:
+        await storage.upload_generated_file(
+            out,
+            uploaded_by=message.from_user.id,
+            purpose="generated_docx",
+            mime_type=(
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            ),
+        )
         await message.answer_document(
             FSInputFile(out), caption="✅ فایل Word آماده شد")
         await models.add_convert_job(message.from_user.id, "pdf", "docx", output_type=out.name)

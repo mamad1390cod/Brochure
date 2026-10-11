@@ -11,6 +11,7 @@ from aiogram.filters import StateFilter
 
 import models
 import keyboards
+import storage
 from utils import format_note_info, get_file_type_emoji, escape_html
 from logger import logger
 
@@ -331,6 +332,29 @@ async def submit_receive_file(message: Message, state: FSMContext):
     # Determine status
     status = "approved" if is_trusted else "pending"
 
+    try:
+        stored_file = await storage.upload_telegram_file(
+            message.bot,
+            telegram_file_id=file_id,
+            telegram_file_unique_id=file_unique_id,
+            original_filename=file_name,
+            mime_type=mime_type,
+            file_size=file_size or None,
+            uploaded_by=message.from_user.id,
+            purpose="note",
+        )
+    except Exception as exc:
+        logger.error(
+            "Note media storage failed for user %s (%s)",
+            message.from_user.id,
+            type(exc).__name__,
+        )
+        await message.answer(
+            "❌ ذخیره فایل در فضای ابری ناموفق بود؛ جزوه ثبت نشد. "
+            "لطفاً کمی بعد دوباره فایل را ارسال کنید."
+        )
+        return
+
     # Always snapshot the file into the admin notification message
     note_data_for_admin = {
         "title": data.get("title", ""),
@@ -362,6 +386,7 @@ async def submit_receive_file(message: Message, state: FSMContext):
         file_size=file_size,
         submitted_by=message.from_user.id,
         submitted_by_name=message.from_user.full_name or message.from_user.username or "",
+        storage_file_id=stored_file.id,
         status=status,
     )
 

@@ -21,7 +21,7 @@ from config import DATABASE_PATH, MAIN_ADMIN_ID
 from logger import logger
 
 BACKUP_INTERVAL_SECONDS = 4 * 60 * 60
-BACKUP_DIR = Path(DATABASE_PATH).parent / "backups"
+BACKUP_DIR = Path(tempfile.gettempdir()) / "brochure_backups"
 BACKUP_TIMEZONE = ZoneInfo("Asia/Tehran")
 _backup_lock = asyncio.Lock()
 

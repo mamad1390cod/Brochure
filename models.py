@@ -252,6 +252,7 @@ async def create_note(
     file_size: int,
     submitted_by: int,
     submitted_by_name: str,
+    storage_file_id: Optional[str] = None,
     status: str = "pending",
 ) -> int:
     async with db_write_session() as db:
@@ -259,11 +260,13 @@ async def create_note(
             """INSERT INTO notes
             (title, description, field_id, subject_id, chapter_id,
              page_start, page_end, file_type, file_id, file_unique_id,
-             file_name, mime_type, file_size, submitted_by, submitted_by_name, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             file_name, mime_type, file_size, storage_file_id,
+             submitted_by, submitted_by_name, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (title, description, field_id, subject_id, chapter_id,
              page_start, page_end, file_type, file_id, file_unique_id,
-             file_name, mime_type, file_size, submitted_by, submitted_by_name, status),
+             file_name, mime_type, file_size, storage_file_id,
+             submitted_by, submitted_by_name, status),
         )
         await db.commit()
         note_id = cursor.lastrowid
@@ -1082,15 +1085,16 @@ async def create_task(
     day_index: Optional[int] = None,
     due_at: Optional[str] = None,
     file_id: Optional[str] = None,
+    storage_file_id: Optional[str] = None,
 ) -> int:
     async with db_write_session() as db:
         cursor = await db.execute(
             """INSERT INTO tasks
             (category_id, title, details, created_by, field_id, subject_id,
-             day_index, due_at, file_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             day_index, due_at, file_id, storage_file_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (category_id, title.strip(), details.strip(), created_by, field_id,
-             subject_id, day_index, due_at, file_id),
+             subject_id, day_index, due_at, file_id, storage_file_id),
         )
         await db.commit()
         task_id = cursor.lastrowid

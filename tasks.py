@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 import models
 import keyboards
+import storage
 from utils import escape_html
 from logger import logger
 
@@ -215,9 +216,23 @@ async def task_photo_handler(callback: CallbackQuery):
         await callback.answer("تصویر این تکلیف در دسترس نیست.", show_alert=True)
         return
     await callback.answer()
-    await callback.message.answer_photo(
-        task["file_id"], caption=f"🖼 {escape_html(task['title'])}"
-    )
+    try:
+        await storage.send_stored_file(
+            callback.message,
+            telegram_file_id=task["file_id"],
+            storage_file_id=task["storage_file_id"],
+            file_type="photo",
+            caption=f"🖼 {escape_html(task['title'])}",
+        )
+    except Exception as exc:
+        logger.warning(
+            "Homework image delivery failed for task %s (%s)",
+            task_id,
+            type(exc).__name__,
+        )
+        await callback.message.answer(
+            "❌ تصویر تکلیف در دسترس نیست؛ لطفاً بعداً تلاش کنید."
+        )
 
 
 # ─── Admin: Entry Menu ──────────────────────────────────────────────────────
@@ -582,7 +597,12 @@ async def tasks_deadline_not_text(message: Message):
     await message.answer("❌ مهلت را به‌صورت متن و طبق نمونه ارسال کنید.")
 
 
-async def _save_task(message: Message, state: FSMContext, file_id: str | None) -> None:
+async def _save_task(
+    message: Message,
+    state: FSMContext,
+    file_id: str | None,
+    storage_file_id: str | None,
+) -> None:
     data = await state.get_data()
     category_id = data.get("task_category_id")
     if category_id is None:
@@ -599,6 +619,7 @@ async def _save_task(message: Message, state: FSMContext, file_id: str | None) -
         day_index=data["task_day_index"],
         due_at=data["task_due_at"],
         file_id=file_id,
+        storage_file_id=storage_file_id,
     )
     summary_task = {
         "id": task_id,
@@ -626,7 +647,30 @@ async def _save_task(message: Message, state: FSMContext, file_id: str | None) -
 
 @router.message(StateFilter(TaskAddFlow.entering_image), F.photo)
 async def tasks_image_photo_handler(message: Message, state: FSMContext):
-    await _save_task(message, state, message.photo[-1].file_id)
+    photo = message.photo[-1]
+    try:
+        stored = await storage.upload_telegram_file(
+            message.bot,
+            telegram_file_id=photo.file_id,
+            telegram_file_unique_id=photo.file_unique_id,
+            original_filename=f"homework_{photo.file_unique_id}.jpg",
+            mime_type="image/jpeg",
+            file_size=photo.file_size,
+            uploaded_by=message.from_user.id,
+            purpose="homework",
+        )
+    except Exception as exc:
+        logger.error(
+            "Homework image storage failed for user %s (%s)",
+            message.from_user.id,
+            type(exc).__name__,
+        )
+        await message.answer(
+            "❌ ذخیره تصویر در فضای ابری ناموفق بود؛ تکلیف ثبت نشد. "
+            "لطفاً کمی بعد دوباره تصویر را ارسال کنید."
+        )
+        return
+    await _save_task(message, state, photo.file_id, stored.id)
 
 
 @router.message(StateFilter(TaskAddFlow.entering_image), F.document)
@@ -635,7 +679,29 @@ async def tasks_image_document_handler(message: Message, state: FSMContext):
     if not (document.mime_type or "").lower().startswith("image/"):
         await message.answer("❌ لطفاً یک تصویر بفرستید یا «رد» را برای بدون تصویر ارسال کنید.")
         return
-    await _save_task(message, state, document.file_id)
+    try:
+        stored = await storage.upload_telegram_file(
+            message.bot,
+            telegram_file_id=document.file_id,
+            telegram_file_unique_id=document.file_unique_id,
+            original_filename=document.file_name or f"homework_{document.file_unique_id}",
+            mime_type=document.mime_type,
+            file_size=document.file_size,
+            uploaded_by=message.from_user.id,
+            purpose="homework",
+        )
+    except Exception as exc:
+        logger.error(
+            "Homework image storage failed for user %s (%s)",
+            message.from_user.id,
+            type(exc).__name__,
+        )
+        await message.answer(
+            "❌ ذخیره تصویر در فضای ابری ناموفق بود؛ تکلیف ثبت نشد. "
+            "لطفاً کمی بعد دوباره تصویر را ارسال کنید."
+        )
+        return
+    await _save_task(message, state, document.file_id, stored.id)
 
 
 @router.message(StateFilter(TaskAddFlow.entering_image), F.text)
@@ -643,7 +709,7 @@ async def tasks_skip_image_handler(message: Message, state: FSMContext):
     if (message.text or "").strip().casefold() not in {"رد", "بدون عکس", "بدون تصویر"}:
         await message.answer("برای تکمیل، تصویر بفرستید یا عبارت «رد» را ارسال کنید.")
         return
-    await _save_task(message, state, None)
+    await _save_task(message, state, None, None)
 
 
 @router.message(StateFilter(TaskAddFlow.entering_image))
