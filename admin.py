@@ -1440,8 +1440,39 @@ async def note_delete_handler(callback: CallbackQuery):
         await callback.answer("❌ جزوه یافت نشد!", show_alert=True)
         return
 
-    await models.delete_note(note_id)
-    await callback.answer(f"🗑 جزوه «{note['title']}» حذف شد.", show_alert=True)
+    storage_file_id = note["storage_file_id"]
+    drive_file_removed = False
+    try:
+        if storage_file_id:
+            drive_file_removed = await storage.delete_file(
+                storage_file_id,
+                ignore_note_ids=(note_id,),
+            )
+        await models.delete_note(
+            note_id,
+            release_storage_file_id=storage_file_id,
+        )
+    except Exception as exc:
+        logger.error(
+            "Admin note deletion failed for note %s (%s): %s",
+            note_id,
+            type(exc).__name__,
+            storage.drive_error_hint(exc),
+        )
+        await callback.answer(
+            "❌ حذف کامل نشد؛ اطلاعات جزوه برای تلاش مجدد حفظ شد.",
+            show_alert=True,
+        )
+        return
+
+    if storage_file_id and not drive_file_removed:
+        await callback.answer(
+            f"🗑 جزوه «{note['title']}» حذف شد؛ فایل Drive به‌دلیل استفادهٔ "
+            "رکورد دیگری حفظ شد.",
+            show_alert=True,
+        )
+    else:
+        await callback.answer(f"🗑 جزوه «{note['title']}» حذف شد.", show_alert=True)
 
     # Show updated notes list
     notes = await models.get_approved_notes(limit=20)

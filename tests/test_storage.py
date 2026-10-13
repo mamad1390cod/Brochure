@@ -9,14 +9,170 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import SendDocument
 
 import database
+import models
 import migrate_files_to_drive
 import migrate_database_path
 import storage
-from database import db_session
+from database import db_session, db_write_session
 
 REAL_UPLOAD_FILE = storage.upload_file
 REAL_UPLOAD_TELEGRAM_FILE = storage.upload_telegram_file
 REAL_CHECK_DRIVE_READY = storage.check_drive_ready
+
+
+async def _insert_stored_file(stored_id="stored-delete-id", drive_id="real-drive-id"):
+    async with db_write_session() as db:
+        await db.execute(
+            """INSERT INTO stored_files
+            (id, drive_file_id, source_key, original_filename, purpose)
+            VALUES (?, ?, ?, ?, ?)""",
+            (stored_id, drive_id, f"test:{stored_id}", "lesson.pdf", "note"),
+        )
+        await db.commit()
+
+
+async def _create_note_with_storage_file(storage_file_id, title):
+    field_id = await models.create_field(f"field-{title}")
+    subject_id = await models.create_subject(field_id, f"subject-{title}")
+    return await models.create_note(
+        title=title,
+        description="",
+        field_id=field_id,
+        subject_id=subject_id,
+        chapter_id=None,
+        page_start=None,
+        page_end=None,
+        file_type="document",
+        file_id=f"telegram-{title}",
+        file_unique_id=f"unique-{title}",
+        file_name="lesson.pdf",
+        mime_type="application/pdf",
+        file_size=10,
+        submitted_by=1,
+        submitted_by_name="test",
+        storage_file_id=storage_file_id,
+    )
+
+
+class _FakeDeleteRequest:
+    def __init__(self, calls, error=None):
+        self.calls = calls
+        self.error = error
+
+    def execute(self, num_retries):
+        self.calls.append(("execute", num_retries))
+        if self.error:
+            raise self.error
+
+
+class _FakeDriveFiles:
+    def __init__(self, calls, error=None):
+        self.calls = calls
+        self.error = error
+
+    def delete(self, **kwargs):
+        self.calls.append(("delete", kwargs))
+        return _FakeDeleteRequest(self.calls, self.error)
+
+
+@pytest.mark.asyncio
+async def test_delete_file_uses_drive_id_and_leaves_metadata_for_db_finalization(
+    app, monkeypatch
+):
+    await _insert_stored_file()
+    calls = []
+    files = _FakeDriveFiles(calls)
+    monkeypatch.setattr(
+        storage,
+        "_build_drive_service",
+        lambda: SimpleNamespace(files=lambda: files),
+    )
+
+    assert await storage.delete_file("stored-delete-id") is True
+    assert calls == [
+        (
+            "delete",
+            {"fileId": "real-drive-id", "supportsAllDrives": True},
+        ),
+        ("execute", storage._MAX_RETRIES),
+    ]
+    assert await storage.get_stored_file("stored-delete-id") is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_file_api_failure_preserves_stored_metadata(app, monkeypatch):
+    await _insert_stored_file()
+
+    class FakeHttpError(Exception):
+        resp = SimpleNamespace(status=403)
+
+    monkeypatch.setattr(
+        storage,
+        "_build_drive_service",
+        lambda: SimpleNamespace(
+            files=lambda: _FakeDriveFiles([], FakeHttpError("denied"))
+        ),
+    )
+
+    with pytest.raises(FakeHttpError):
+        await storage.delete_file("stored-delete-id")
+    assert await storage.get_stored_file("stored-delete-id") is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_file_treats_drive_404_as_already_deleted(app, monkeypatch):
+    await _insert_stored_file()
+
+    class FakeHttpError(Exception):
+        resp = SimpleNamespace(status=404)
+
+    monkeypatch.setattr(
+        storage,
+        "_build_drive_service",
+        lambda: SimpleNamespace(
+            files=lambda: _FakeDriveFiles([], FakeHttpError("not found"))
+        ),
+    )
+
+    assert await storage.delete_file("stored-delete-id") is True
+    assert await storage.get_stored_file("stored-delete-id") is not None
+
+
+@pytest.mark.asyncio
+async def test_shared_drive_file_is_kept_until_its_last_note_is_deleted(
+    app, monkeypatch
+):
+    await _insert_stored_file()
+    first_note = await _create_note_with_storage_file("stored-delete-id", "first")
+    second_note = await _create_note_with_storage_file("stored-delete-id", "second")
+    calls = []
+    files = _FakeDriveFiles(calls)
+    monkeypatch.setattr(
+        storage,
+        "_build_drive_service",
+        lambda: SimpleNamespace(files=lambda: files),
+    )
+
+    assert await storage.delete_file(
+        "stored-delete-id",
+        ignore_note_ids=(first_note,),
+    ) is False
+    assert calls == []
+    await models.delete_note(
+        first_note,
+        release_storage_file_id="stored-delete-id",
+    )
+    assert await storage.get_stored_file("stored-delete-id") is not None
+
+    assert await storage.delete_file(
+        "stored-delete-id",
+        ignore_note_ids=(second_note,),
+    ) is True
+    await models.delete_note(
+        second_note,
+        release_storage_file_id="stored-delete-id",
+    )
+    assert await storage.get_stored_file("stored-delete-id") is None
 
 
 def test_drive_error_hint_explains_missing_oauth_variables():
@@ -62,20 +218,39 @@ def test_drive_service_reports_missing_variable_names_without_values(monkeypatch
     assert "configured" not in caplog.text
 
 
-def test_drive_service_accepts_cached_naive_oauth_expiry(monkeypatch):
+@pytest.mark.parametrize("expiry_is_naive", [False, True])
+def test_drive_service_normalizes_cached_expiry_for_google_auth(
+    monkeypatch, expiry_is_naive
+):
     monkeypatch.setattr(storage, "GOOGLE_DRIVE_CLIENT_ID", "test-client")
     monkeypatch.setattr(storage, "GOOGLE_DRIVE_CLIENT_SECRET", "test-secret")
     monkeypatch.setattr(storage, "GOOGLE_DRIVE_REFRESH_TOKEN", "test-refresh-token")
     monkeypatch.setattr(storage, "_access_token", "cached-access-token")
+    expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+    if expiry_is_naive:
+        expiry = expiry.replace(tzinfo=None)
     monkeypatch.setattr(
         storage,
         "_access_token_expiry",
-        (datetime.now(timezone.utc) + timedelta(hours=1)).replace(tzinfo=None),
+        expiry,
     )
 
-    service = storage._build_drive_service()
+    from googleapiclient import discovery
 
-    assert service is not None
+    built_credentials = []
+    monkeypatch.setattr(
+        discovery,
+        "build",
+        lambda *args, **kwargs: built_credentials.append(kwargs["credentials"]),
+    )
+
+    storage._build_drive_service()
+
+    assert len(built_credentials) == 1
+    credentials = built_credentials[0]
+    assert credentials.expiry is not None
+    assert credentials.expiry.tzinfo is None
+    assert credentials.expired is False
 
 
 @pytest.mark.asyncio

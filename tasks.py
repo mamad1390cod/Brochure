@@ -371,15 +371,51 @@ async def tasks_cat_rename_name(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("tasks_cat_delete:"))
 async def tasks_cat_delete_handler(callback: CallbackQuery):
     """Delete a category AND its tasks (cascade)."""
-    await callback.answer()
     cat_id = int(callback.data.split(":")[1])
     cat = await models.get_task_category_by_id(cat_id)
     if not cat:
         await callback.answer("❌ دسته‌بندی یافت نشد!", show_alert=True)
         return
-    removed = await models.delete_task_category(cat_id)
-    await callback.answer(
-        f"🗑 دسته‌بندی و {removed} تکلیف آن حذف شد.", show_alert=True)
+
+    category_tasks = await models.get_tasks_for_category_delete(cat_id)
+    task_ids = tuple(task["id"] for task in category_tasks)
+    storage_file_ids = tuple(
+        dict.fromkeys(
+            task["storage_file_id"]
+            for task in category_tasks
+            if task["storage_file_id"]
+        )
+    )
+    shared_files_retained = False
+    try:
+        for storage_file_id in storage_file_ids:
+            removed_from_drive = await storage.delete_file(
+                storage_file_id,
+                ignore_task_ids=task_ids,
+            )
+            if not removed_from_drive:
+                shared_files_retained = True
+        removed = await models.delete_task_category(
+            cat_id,
+            release_storage_file_ids=list(storage_file_ids),
+        )
+    except Exception as exc:
+        logger.error(
+            "Task category deletion failed for category %s (%s): %s",
+            cat_id,
+            type(exc).__name__,
+            storage.drive_error_hint(exc),
+        )
+        await callback.answer(
+            "❌ حذف کامل نشد؛ رکوردها و شناسه‌های فایل برای تلاش مجدد حفظ شدند.",
+            show_alert=True,
+        )
+        return
+
+    result = f"🗑 دسته‌بندی و {removed} تکلیف آن حذف شد."
+    if shared_files_retained:
+        result += " فایل Drive مشترک به‌دلیل استفاده در رکورد دیگری حفظ شد."
+    await callback.answer(result, show_alert=True)
     await models.add_log(
         callback.from_user.id, callback.from_user.username or "",
         "delete_task_category", f"{cat['name']} ({removed} tasks)",
@@ -772,8 +808,37 @@ async def tasks_task_delete_handler(callback: CallbackQuery):
     if not task["is_active"]:
         await callback.answer("این تکلیف دیگر فعال نیست.", show_alert=True)
         return
-    await models.delete_task(task_id)
-    await callback.answer("🗑 تکلیف حذف شد.", show_alert=True)
+    storage_file_id = task["storage_file_id"]
+    drive_file_removed = False
+    try:
+        if storage_file_id:
+            drive_file_removed = await storage.delete_file(
+                storage_file_id,
+                ignore_task_ids=(task_id,),
+            )
+        await models.delete_task(
+            task_id,
+            release_storage_file_id=storage_file_id,
+        )
+    except Exception as exc:
+        logger.error(
+            "Task deletion failed for task %s (%s): %s",
+            task_id,
+            type(exc).__name__,
+            storage.drive_error_hint(exc),
+        )
+        await callback.answer(
+            "❌ حذف کامل نشد؛ اطلاعات تکلیف برای تلاش مجدد حفظ شد.",
+            show_alert=True,
+        )
+        return
+    if storage_file_id and not drive_file_removed:
+        await callback.answer(
+            "🗑 تکلیف حذف شد؛ فایل Drive به‌دلیل استفادهٔ رکورد دیگری حفظ شد.",
+            show_alert=True,
+        )
+    else:
+        await callback.answer("🗑 تکلیف حذف شد.", show_alert=True)
     await models.add_log(
         callback.from_user.id, callback.from_user.username or "",
         "delete_task", f"#{task_id}: {task['title']}",

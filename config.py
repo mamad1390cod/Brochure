@@ -96,7 +96,7 @@ LOG_LEVEL: str = _get_env("LOG_LEVEL", default="INFO").upper()
 # ─── PDF Bot (bot1cc.py) ─────────────────────────────────────────────────────
 # Optional standalone PDF bot launched as a separate process alongside the
 # main bot. Path is configurable (never hard-coded) - e.g.:
-#   PDF_BOT_PATH=I:\python\botha\BOT1\bot1cc.py
+#   PDF_BOT_PATH=C:\path\to\bot1cc.py
 # If unset or the file does not exist, the main bot runs fine without it and
 # the in-app PDF tools remain fully functional.
 

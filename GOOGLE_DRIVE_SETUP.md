@@ -21,6 +21,11 @@
   created. If the subsequent SQLite write fails, a retry can reuse the Drive
   object. If Telegram delivery fails after a generated file is stored, that
   Drive copy and its metadata are retained.
+- Deleting a note or homework item permanently deletes its private Drive file
+  when no other note or task references that stored file. A shared file is
+  retained until its remaining records are removed. Drive failures leave the
+  database record and storage reference available for a retry; a Drive `404`
+  is treated as an already-completed deletion.
 
 ## Google Cloud OAuth setup
 
@@ -153,12 +158,12 @@ created only as needed by Telegram downloads and the existing conversion
 libraries, and are removed after processing.
 
 There is also an optional standalone PDF bot configured through
-`PDF_BOT_PATH`. In the inspected local configuration it points outside this
-repository to `I:\python\botha\BOT1\bot1cc.py`, whose separate handlers write to
-its own `temp_images` folder. That external program is not part of this GitHub
-repository and is **not** changed or migrated by this integration. Disable it
-on Railway unless it is separately deployed and updated to use the same
-storage service.
+`PDF_BOT_PATH`. Its script is not part of this repository, so configure that
+variable only with a path that exists on the target machine. Leave it unset
+when the external script is unavailable; the main bot and its in-app PDF tools
+continue to work. The separate program's handlers write to its own
+`temp_images` folder and are **not** changed or migrated by this integration.
+Deploy it separately and update it to use the same storage service if needed.
 
 ## Rollback
 

@@ -307,33 +307,71 @@ async def get_approved_notes(
 
 
 async def search_notes(keyword: str, limit: int = 10) -> List[aiosqlite.Row]:
-    """Search approved notes by keyword in title or description."""
+    """Search downloadable approved notes by all query terms across note metadata."""
+    search_fields = (
+        "n.title",
+        "n.file_name",
+        "n.description",
+        "sf.name",
+        "s.name",
+        "c.name",
+    )
+    tokens = list(dict.fromkeys(
+        token.strip(" \t\r\n,،.!?؟؛;:()[]{}<>\"'“”‘’")
+        for token in keyword.split()
+    ))
+    tokens = [token for token in tokens if token]
+    if not tokens:
+        return []
+
+    term_conditions = []
+    params: list[str | int] = []
+    for token in tokens:
+        term_conditions.append(
+            "(" + " OR ".join(
+                f"{field} LIKE ? ESCAPE '\\'" for field in search_fields
+            ) + ")"
+        )
+        like = f"%{_escape_like(token)}%"
+        params.extend([like] * len(search_fields))
+
     async with db_session() as db:
-        like = f"%{_escape_like(keyword)}%"
         rows = await db.execute_fetchall(
-            """SELECT n.*, sf.name as field_name, s.name as subject_name, c.name as chapter_name
+            """SELECT n.*, sf.name as field_name, s.name as subject_name,
+                      c.name as chapter_name,
+                      stored_file.telegram_file_id AS storage_telegram_file_id
             FROM notes n
             LEFT JOIN study_fields sf ON n.field_id = sf.id
             LEFT JOIN subjects s ON n.subject_id = s.id
             LEFT JOIN chapters c ON n.chapter_id = c.id
+            LEFT JOIN stored_files stored_file
+                ON n.storage_file_id = stored_file.id
             WHERE n.status = 'approved' AND n.is_active = 1
-            AND (n.title LIKE ? ESCAPE '\\' OR n.description LIKE ? ESCAPE '\\' OR sf.name LIKE ? ESCAPE '\\' OR s.name LIKE ? ESCAPE '\\' OR c.name LIKE ? ESCAPE '\\')
+            AND COALESCE(NULLIF(TRIM(n.file_id), ''),
+                         NULLIF(TRIM(stored_file.telegram_file_id), '')) IS NOT NULL
+            AND """ + " AND ".join(term_conditions) + """
             ORDER BY n.created_at DESC LIMIT ?""",
-            (like, like, like, like, like, limit),
+            (*params, limit),
         )
     return rows
 
 
 async def get_recent_notes(limit: int = 10) -> List[aiosqlite.Row]:
-    """Get the most recent approved notes with joined names."""
+    """Get recent approved notes that have a Telegram media reference."""
     async with db_session() as db:
         rows = await db.execute_fetchall(
-            """SELECT n.*, sf.name as field_name, s.name as subject_name, c.name as chapter_name
+            """SELECT n.*, sf.name as field_name, s.name as subject_name,
+                      c.name as chapter_name,
+                      stored_file.telegram_file_id AS storage_telegram_file_id
             FROM notes n
             LEFT JOIN study_fields sf ON n.field_id = sf.id
             LEFT JOIN subjects s ON n.subject_id = s.id
             LEFT JOIN chapters c ON n.chapter_id = c.id
+            LEFT JOIN stored_files stored_file
+                ON n.storage_file_id = stored_file.id
             WHERE n.status = 'approved' AND n.is_active = 1
+            AND COALESCE(NULLIF(TRIM(n.file_id), ''),
+                         NULLIF(TRIM(stored_file.telegram_file_id), '')) IS NOT NULL
             ORDER BY n.created_at DESC LIMIT ?""",
             (limit,),
         )
@@ -356,9 +394,43 @@ async def update_note(note_id: int, **kwargs) -> None:
         await db.commit()
 
 
-async def delete_note(note_id: int) -> None:
-    """Soft delete a note."""
-    await update_note(note_id, is_active=0)
+async def _delete_unreferenced_storage_metadata(db, storage_file_ids) -> None:
+    for storage_file_id in set(storage_file_ids):
+        if not storage_file_id:
+            continue
+        await db.execute(
+            """DELETE FROM stored_files WHERE id = ?
+            AND NOT EXISTS (SELECT 1 FROM notes WHERE storage_file_id = ?)
+            AND NOT EXISTS (SELECT 1 FROM tasks WHERE storage_file_id = ?)""",
+            (storage_file_id, storage_file_id, storage_file_id),
+        )
+
+
+async def delete_note(
+    note_id: int,
+    *,
+    release_storage_file_id: Optional[str] = None,
+) -> None:
+    """Soft delete a note and release its stored-file reference when supplied."""
+    async with db_write_session() as db:
+        if release_storage_file_id:
+            await db.execute(
+                """UPDATE notes SET is_active = 0,
+                storage_file_id = CASE WHEN storage_file_id = ? THEN NULL
+                    ELSE storage_file_id END,
+                updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                (release_storage_file_id, note_id),
+            )
+            await _delete_unreferenced_storage_metadata(
+                db, [release_storage_file_id]
+            )
+        else:
+            await db.execute(
+                """UPDATE notes SET is_active = 0, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?""",
+                (note_id,),
+            )
+        await db.commit()
 
 
 async def delete_notes_bulk(note_ids: list) -> None:
@@ -1059,7 +1131,20 @@ async def rename_task_category(cat_id: int, new_name: str) -> None:
         )
         await db.commit()
 
-async def delete_task_category(cat_id: int) -> int:
+async def get_tasks_for_category_delete(cat_id: int) -> List[aiosqlite.Row]:
+    async with db_session() as db:
+        rows = await db.execute_fetchall(
+            "SELECT id, storage_file_id FROM tasks WHERE category_id = ?",
+            (cat_id,),
+        )
+    return rows
+
+
+async def delete_task_category(
+    cat_id: int,
+    *,
+    release_storage_file_ids: Optional[list[str]] = None,
+) -> int:
     """Delete a category and (cascade) its tasks. Returns deleted task count."""
     async with db_write_session() as db:
         row = await db.execute_fetchall(
@@ -1068,6 +1153,10 @@ async def delete_task_category(cat_id: int) -> int:
         count = row[0]["cnt"] if row else 0
         await db.execute("DELETE FROM tasks WHERE category_id = ?", (cat_id,))
         await db.execute("DELETE FROM task_categories WHERE id = ?", (cat_id,))
+        if release_storage_file_ids:
+            await _delete_unreferenced_storage_metadata(
+                db, release_storage_file_ids
+            )
         await db.commit()
     return count
 
@@ -1183,10 +1272,27 @@ async def get_task_by_id(task_id: int) -> Optional[aiosqlite.Row]:
     return row[0] if row else None
 
 
-async def delete_task(task_id: int) -> None:
-    """Soft delete a task."""
+async def delete_task(
+    task_id: int,
+    *,
+    release_storage_file_id: Optional[str] = None,
+) -> None:
+    """Soft delete a task and release its stored-file reference when supplied."""
     async with db_write_session() as db:
-        await db.execute("UPDATE tasks SET is_active = 0 WHERE id = ?", (task_id,))
+        if release_storage_file_id:
+            await db.execute(
+                """UPDATE tasks SET is_active = 0,
+                storage_file_id = CASE WHEN storage_file_id = ? THEN NULL
+                    ELSE storage_file_id END WHERE id = ?""",
+                (release_storage_file_id, task_id),
+            )
+            await _delete_unreferenced_storage_metadata(
+                db, [release_storage_file_id]
+            )
+        else:
+            await db.execute(
+                "UPDATE tasks SET is_active = 0 WHERE id = ?", (task_id,)
+            )
         await db.commit()
 
 

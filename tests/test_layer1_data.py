@@ -200,6 +200,49 @@ async def test_search_notes_wildcards_are_literal(app):
     assert await models.search_notes("_") == []
 
 
+async def test_search_notes_matches_each_term_across_note_and_filename(app):
+    _, field_id, subject_id, chapter_id = await _make_note(
+        title="تمرین",
+        description="حل مسئله",
+        field="ریاضی",
+        subject="هندسه",
+        chapter="فصل دوم",
+        file_name="worksheet.pdf",
+    )
+
+    results = await models.search_notes("ریاضی فصل دوم")
+    assert len(results) == 1
+    assert results[0]["field_name"] == "ریاضی"
+    assert results[0]["chapter_name"] == "فصل دوم"
+
+    await models.create_note(
+        title="جزوه",
+        description="",
+        field_id=field_id,
+        subject_id=subject_id,
+        chapter_id=chapter_id,
+        page_start=None,
+        page_end=None,
+        file_type="document",
+        file_id="FILE-NAME",
+        file_unique_id="UNIQ-NAME",
+        file_name="آزمون فصل دوم.pdf",
+        mime_type="application/pdf",
+        file_size=100,
+        submitted_by=42,
+        submitted_by_name="Ali",
+        status="approved",
+    )
+    filename_results = await models.search_notes("آزمون فصل دوم")
+    assert len(filename_results) == 1
+    assert filename_results[0]["file_id"] == "FILE-NAME"
+
+
+async def test_search_notes_excludes_approved_records_without_media(app):
+    await _make_note(title="بدون فایل", file_id="")
+    assert await models.search_notes("بدون فایل") == []
+
+
 async def test_count_notes_filters(app):
     await _make_note(status="approved")
     await _make_note(status="pending")

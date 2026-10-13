@@ -60,6 +60,14 @@ def _expiry_as_utc(expiry: datetime | None) -> datetime | None:
     return expiry.astimezone(timezone.utc)
 
 
+def _expiry_for_google_auth(expiry: datetime | None) -> datetime | None:
+    expiry_utc = _expiry_as_utc(expiry)
+    if expiry_utc is None:
+        return None
+    # google-auth compares credential expiry against a naive UTC timestamp.
+    return expiry_utc.replace(tzinfo=None)
+
+
 def drive_error_hint(exc: Exception) -> str:
     """Return a safe, actionable summary without logging Google credentials."""
     if isinstance(exc, StorageConfigurationError):
@@ -206,7 +214,7 @@ def _build_drive_service():
                 client_id=GOOGLE_DRIVE_CLIENT_ID,
                 client_secret=GOOGLE_DRIVE_CLIENT_SECRET,
                 scopes=[_DRIVE_SCOPE],
-                expiry=_expiry_as_utc(_access_token_expiry),
+                expiry=_expiry_for_google_auth(_access_token_expiry),
             )
         return build(
             "drive",
@@ -736,34 +744,58 @@ async def file_exists(stored_file_id: str) -> bool:
         return False
 
 
-async def delete_file(stored_file_id: str) -> None:
+def _delete_remote_file_sync(drive_file_id: str) -> None:
+    service = _build_drive_service()
+    try:
+        service.files().delete(
+            fileId=drive_file_id,
+            supportsAllDrives=True,
+        ).execute(num_retries=_MAX_RETRIES)
+    except Exception as exc:
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        if status == 404:
+            logger.info("Google Drive file was already absent during deletion.")
+            return
+        logger.error(
+            "Google Drive file deletion failed (%s): %s",
+            type(exc).__name__,
+            drive_error_hint(exc),
+        )
+        raise
+
+
+async def delete_file(
+    stored_file_id: str,
+    *,
+    ignore_note_ids: tuple[int, ...] = (),
+    ignore_task_ids: tuple[int, ...] = (),
+) -> bool:
+    """Permanently delete an unshared Drive file; leave metadata for DB finalization.
+
+    Returns False when another note or task still references the same stored file.
+    """
     stored = await get_stored_file(stored_file_id)
     if stored is None:
-        return
-    async with db_session() as db:
-        references = await db.execute_fetchall(
-            """SELECT 1 FROM notes WHERE storage_file_id = ?
-               UNION ALL
-               SELECT 1 FROM tasks WHERE storage_file_id = ?
-               LIMIT 1""",
-            (stored_file_id, stored_file_id),
+        raise StoredFileNotFoundError(
+            f"Stored file {stored_file_id} is not registered."
         )
-    if references:
-        raise ValueError("Cannot delete a Drive file that is linked to a note or task.")
-    service = await asyncio.to_thread(_build_drive_service)
-    await asyncio.to_thread(
-        service.files().delete(
-            fileId=stored.drive_file_id,
-            supportsAllDrives=True,
-        ).execute,
-        num_retries=_MAX_RETRIES,
-    )
-    async with db_write_session() as db:
-        await db.execute(
-            "DELETE FROM stored_files WHERE id = ?",
+    async with db_session() as db:
+        note_references = await db.execute_fetchall(
+            "SELECT id FROM notes WHERE storage_file_id = ?",
             (stored_file_id,),
         )
-        await db.commit()
+        task_references = await db.execute_fetchall(
+            "SELECT id FROM tasks WHERE storage_file_id = ?",
+            (stored_file_id,),
+        )
+    if any(row["id"] not in ignore_note_ids for row in note_references) or any(
+        row["id"] not in ignore_task_ids for row in task_references
+    ):
+        logger.info("Google Drive file retained because another record references it.")
+        return False
+
+    await asyncio.to_thread(_delete_remote_file_sync, stored.drive_file_id)
+    return True
 
 
 def _send_method(message: Message, file_type: str):

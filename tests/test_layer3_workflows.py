@@ -758,7 +758,61 @@ async def test_note_edit_changes_title(app, private_chat):
     assert (await models.get_note_by_id(nid))["title"] == "جدید"
 
 
-async def test_admin_delete_note_hides_it(app, private_chat):
+async def test_admin_delete_note_hides_it(app, private_chat, monkeypatch):
+    fid, sid, cid = await seed_taxonomy()
+    chat = private_chat
+    owner = make_user(OWNER_ID, "owner", "Owner")
+    from database import db_write_session
+
+    async with db_write_session() as db:
+        await db.execute(
+            """INSERT INTO stored_files
+            (id, drive_file_id, source_key, original_filename, purpose)
+            VALUES (?, ?, ?, ?, ?)""",
+            ("note-drive-id", "google-note-file-id", "test:note", "a.pdf", "note"),
+        )
+        await db.commit()
+    delete_calls = []
+
+    async def delete_drive_file(stored_file_id, **kwargs):
+        delete_calls.append((stored_file_id, kwargs))
+        return True
+
+    import storage
+
+    monkeypatch.setattr(storage, "delete_file", delete_drive_file)
+    nid = await models.create_note(
+        title="حذفی",
+        description="",
+        field_id=fid,
+        subject_id=sid,
+        chapter_id=cid,
+        page_start=None,
+        page_end=None,
+        file_type="document",
+        file_id="F",
+        file_unique_id="U",
+        file_name="a.pdf",
+        mime_type="application/pdf",
+        file_size=10,
+        submitted_by=USER_ID,
+        submitted_by_name="Ali",
+        status="approved",
+        storage_file_id="note-drive-id",
+    )
+    await bootstrap(app, chat, owner)
+    await app.click(chat, owner, "admin_login")
+    await app.click(chat, owner, f"note_delete:{nid}")
+    assert (await models.get_note_by_id(nid))["is_active"] == 0
+    assert (await models.get_note_by_id(nid))["storage_file_id"] is None
+    assert delete_calls == [("note-drive-id", {"ignore_note_ids": (nid,)})]
+    assert await storage.get_stored_file("note-drive-id") is None
+    assert await models.get_approved_notes() == []
+
+
+async def test_admin_delete_note_preserves_record_when_drive_delete_fails(
+    app, private_chat, monkeypatch
+):
     fid, sid, cid = await seed_taxonomy()
     chat = private_chat
     owner = make_user(OWNER_ID, "owner", "Owner")
@@ -779,12 +833,23 @@ async def test_admin_delete_note_hides_it(app, private_chat):
         submitted_by=USER_ID,
         submitted_by_name="Ali",
         status="approved",
+        storage_file_id="note-drive-id",
     )
+
+    import storage
+
+    async def fail_drive_delete(*args, **kwargs):
+        raise RuntimeError("simulated Drive outage")
+
+    monkeypatch.setattr(storage, "delete_file", fail_drive_delete)
     await bootstrap(app, chat, owner)
     await app.click(chat, owner, "admin_login")
     await app.click(chat, owner, f"note_delete:{nid}")
-    assert (await models.get_note_by_id(nid))["is_active"] == 0
-    assert await models.get_approved_notes() == []
+
+    note = await models.get_note_by_id(nid)
+    assert note["is_active"] == 1
+    assert note["storage_file_id"] == "note-drive-id"
+    assert "حذف کامل نشد" in app.session.alerts()[-1]
 
 
 async def test_notes_pagination(app, private_chat):
@@ -930,9 +995,18 @@ async def test_owner_promote_and_demote(app, private_chat):
 # ─── tasks (تکالیف) workflow ─────────────────────────────────────────────────
 
 
-async def test_task_management_workflow(app, private_chat):
+async def test_task_management_workflow(app, private_chat, monkeypatch):
     chat = private_chat
     owner = make_user(OWNER_ID, "owner", "Owner")
+    delete_calls = []
+
+    async def delete_drive_file(stored_file_id, **kwargs):
+        delete_calls.append((stored_file_id, kwargs))
+        return True
+
+    import storage
+
+    monkeypatch.setattr(storage, "delete_file", delete_drive_file)
     await bootstrap(app, chat, owner)
     await app.click(chat, owner, "admin_login")
 
@@ -982,6 +1056,45 @@ async def test_task_management_workflow(app, private_chat):
     await app.click(chat, owner, f"tasks_cat_manage:{category_id}")
     await app.click(chat, owner, f"tasks_cat_delete:{category_id}")
     assert await models.get_all_tasks_grouped() == {}
+    assert delete_calls == [
+        (
+            task["storage_file_id"],
+            {"ignore_task_ids": (task["id"],)},
+        )
+    ]
+
+
+async def test_admin_delete_task_releases_drive_reference(app, private_chat, monkeypatch):
+    chat = private_chat
+    owner = make_user(OWNER_ID, "owner", "Owner")
+    delete_calls = []
+
+    async def delete_drive_file(stored_file_id, **kwargs):
+        delete_calls.append((stored_file_id, kwargs))
+        return True
+
+    import storage
+
+    monkeypatch.setattr(storage, "delete_file", delete_drive_file)
+    category_id = await models.create_task_category("ریاضی")
+    task_id = await models.create_task(
+        category_id,
+        "تمرین",
+        "شرح",
+        created_by=OWNER_ID,
+        file_id="telegram-task-file",
+        storage_file_id="task-drive-id",
+    )
+    await bootstrap(app, chat, owner)
+    await app.click(chat, owner, "admin_login")
+    await app.click(chat, owner, f"tasks_task_delete:{task_id}")
+
+    task = await models.get_task_by_id(task_id)
+    assert task["is_active"] == 0
+    assert task["storage_file_id"] is None
+    assert delete_calls == [
+        ("task-drive-id", {"ignore_task_ids": (task_id,)})
+    ]
 
 
 async def test_task_flow_cancel_saves_nothing(app, private_chat):
@@ -1253,7 +1366,241 @@ async def test_inline_search(app):
     await app.feed(Update(update_id=9001, inline_query=query))
     answer = app.session.last("AnswerInlineQuery")
     assert answer is not None and len(answer.results) == 1
-    assert "مثلثات" in answer.results[0].title
+    result = answer.results[0]
+    assert type(result).__name__ == "InlineQueryResultCachedDocument"
+    assert result.document_file_id == "F"
+    assert "مثلثات" in result.title
+    assert "حل تمرین" in result.caption
+    assert answer.switch_pm_text is None
+    assert answer.switch_pm_parameter is None
+    assert answer.is_personal is True
+
+
+async def test_inline_search_returns_cached_files_by_media_type(app):
+    fid, sid, cid = await seed_taxonomy()
+    media_types = {
+        "document": ("InlineQueryResultCachedDocument", "document_file_id"),
+        "photo": ("InlineQueryResultCachedPhoto", "photo_file_id"),
+        "video": ("InlineQueryResultCachedVideo", "video_file_id"),
+        "audio": ("InlineQueryResultCachedAudio", "audio_file_id"),
+        "voice": ("InlineQueryResultCachedVoice", "voice_file_id"),
+    }
+    for file_type in media_types:
+        await models.create_note(
+            title=f"inline-media {file_type}",
+            description=(
+                f"description {file_type} " + "😀" * 1200
+                if file_type == "document"
+                else f"description {file_type}"
+            ),
+            field_id=fid,
+            subject_id=sid,
+            chapter_id=cid,
+            page_start=2,
+            page_end=4,
+            file_type=file_type,
+            file_id=f"telegram-{file_type}",
+            file_unique_id=f"unique-{file_type}",
+            file_name=f"{file_type}.bin",
+            mime_type="application/octet-stream",
+            file_size=100,
+            submitted_by=USER_ID,
+            submitted_by_name="Ali",
+            status="approved",
+        )
+
+    user = make_user(USER_ID, "ali", "Ali")
+    query = InlineQuery(
+        id="iq-media",
+        from_user=user,
+        query="inline-media",
+        offset="",
+        chat_type="private",
+    )
+    await app.feed(Update(update_id=9002, inline_query=query))
+
+    answer = app.session.last("AnswerInlineQuery")
+    assert answer is not None
+    results = answer.results
+    by_title = {
+        result.caption.splitlines()[0].removeprefix("📄 "): result
+        for result in results
+    }
+    assert len(results) == len(media_types)
+    for file_type, (expected_type, file_id_field) in media_types.items():
+        result = by_title[f"inline-media {file_type}"]
+        assert type(result).__name__ == expected_type
+        assert getattr(result, file_id_field) == f"telegram-{file_type}"
+        assert f"description {file_type}" in result.caption
+        assert "رشته: ریاضی" in result.caption
+        assert result.parse_mode is None
+        serialized = app.bot.session.prepare_value(
+            result,
+            bot=app.bot,
+            files={},
+            _dumps_json=False,
+        )
+        assert serialized["type"] == file_type
+        assert serialized[file_id_field] == f"telegram-{file_type}"
+        assert len(result.caption.encode("utf-16-le")) // 2 <= 1024
+    document_caption = by_title["inline-media document"].caption
+    assert document_caption.endswith("…")
+
+
+async def test_inline_search_omits_notes_without_telegram_media_id(app):
+    fid, sid, cid = await seed_taxonomy()
+    await models.create_note(
+        title="inline-media missing",
+        description="no usable Telegram media reference",
+        field_id=fid,
+        subject_id=sid,
+        chapter_id=cid,
+        page_start=None,
+        page_end=None,
+        file_type="document",
+        file_id="",
+        file_unique_id="",
+        file_name="missing.pdf",
+        mime_type="application/pdf",
+        file_size=0,
+        submitted_by=USER_ID,
+        submitted_by_name="Ali",
+        status="approved",
+    )
+
+    query = InlineQuery(
+        id="iq-missing",
+        from_user=make_user(USER_ID, "ali", "Ali"),
+        query="inline-media missing",
+        offset="",
+        chat_type="private",
+    )
+    await app.feed(Update(update_id=9003, inline_query=query))
+
+    answer = app.session.last("AnswerInlineQuery")
+    assert answer is not None
+    assert answer.results == []
+    assert answer.switch_pm_text is None
+
+
+async def test_empty_inline_search_shows_only_downloadable_recent_notes(app):
+    fid, sid, cid = await seed_taxonomy()
+    for title, file_id in (
+        ("جزوه بدون فایل", ""),
+        ("جزوه قابل ارسال", "telegram-downloadable-file"),
+    ):
+        await models.create_note(
+            title=title,
+            description="",
+            field_id=fid,
+            subject_id=sid,
+            chapter_id=cid,
+            page_start=None,
+            page_end=None,
+            file_type="document",
+            file_id=file_id,
+            file_unique_id=f"unique-{title}",
+            file_name="lesson.pdf",
+            mime_type="application/pdf",
+            file_size=100,
+            submitted_by=USER_ID,
+            submitted_by_name="Ali",
+            status="approved",
+        )
+
+    query = InlineQuery(
+        id="iq-empty",
+        from_user=make_user(USER_ID, "ali", "Ali"),
+        query="",
+        offset="",
+        chat_type="private",
+    )
+    await app.feed(Update(update_id=9005, inline_query=query))
+
+    answer = app.session.last("AnswerInlineQuery")
+    assert answer is not None and len(answer.results) == 1
+    assert answer.results[0].document_file_id == "telegram-downloadable-file"
+    assert answer.switch_pm_text is None
+
+
+async def test_inline_search_keeps_user_restrictions_without_private_chat_button(
+    app, monkeypatch
+):
+    import inline
+
+    monkeypatch.setattr(inline, "INLINE_SEARCH_ALLOWED_USERS", ["700999"])
+    query = InlineQuery(
+        id="iq-denied",
+        from_user=make_user(USER_ID, "ali", "Ali"),
+        query="ریاضی",
+        offset="",
+        chat_type="private",
+    )
+    await app.feed(Update(update_id=9006, inline_query=query))
+
+    answer = app.session.last("AnswerInlineQuery")
+    assert answer is not None
+    assert answer.results == []
+    assert answer.cache_time == 0
+    assert answer.switch_pm_text is None
+
+
+async def test_inline_search_supports_terms_across_taxonomy_and_drive_metadata(app):
+    from database import db_write_session
+
+    fid, sid, cid = await seed_taxonomy()
+    await models.update_chapter(cid, "فصل دوم")
+    await models.create_note(
+        title="تمرین",
+        description="",
+        field_id=fid,
+        subject_id=sid,
+        chapter_id=cid,
+        page_start=2,
+        page_end=4,
+        file_type="document",
+        file_id="",
+        file_unique_id="drive-only-note",
+        file_name="worksheet.pdf",
+        mime_type="application/pdf",
+        file_size=100,
+        submitted_by=USER_ID,
+        submitted_by_name="Ali",
+        status="approved",
+        storage_file_id="stored-inline-note",
+    )
+    async with db_write_session() as db:
+        await db.execute(
+            """INSERT INTO stored_files
+            (id, drive_file_id, source_key, telegram_file_id,
+             original_filename, purpose)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                "stored-inline-note",
+                "private-drive-object",
+                "inline-test",
+                "telegram-file-from-storage",
+                "worksheet.pdf",
+                "note",
+            ),
+        )
+        await db.commit()
+
+    query = InlineQuery(
+        id="iq-drive-metadata",
+        from_user=make_user(USER_ID, "ali", "Ali"),
+        query="ریاضی فصل دوم",
+        offset="",
+        chat_type="private",
+    )
+    await app.feed(Update(update_id=9004, inline_query=query))
+
+    answer = app.session.last("AnswerInlineQuery")
+    assert answer is not None and len(answer.results) == 1
+    result = answer.results[0]
+    assert type(result).__name__ == "InlineQueryResultCachedDocument"
+    assert result.document_file_id == "telegram-file-from-storage"
+    assert "فصل دوم" in result.caption
 
 
 # ─── file tools ──────────────────────────────────────────────────────────────
